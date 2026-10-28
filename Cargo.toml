@@ -1,0 +1,17 @@
+[package]
+name = "py2rs"
+version = "0.1.0"
+edition = "2021"
+description = "Translate a typed subset of Python into readable Rust"
+license = "MIT"
+
+[dependencies]
+pyrt = { path = "pyrt" }
+ruff_python_parser = "0.0.20"
+ruff_python_ast = "0.0.20"
+ruff_text_size = "0.0.20"
+ruff_source_file = "0.0.20"
+
+[workspace]
+members = [".", "pyrt"]
+exclude = ["target"]

@@ -1,0 +1,1293 @@
+//! Ownership inference and the aliasing check.
+//!
+//! Python shares mutable objects between names; the generated Rust copies,
+//! moves or borrows them. The three are indistinguishable as long as no object
+//! that is shared in Python is modified and then observed through another
+//! name. This pass decides how every parameter is passed (`&T`, `&mut T`, `T`),
+//! where values can be moved instead of cloned, and rejects programs whose
+//! output would depend on sharing.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::diag::{err, Error, Res};
+use crate::ir::*;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mode {
+    /// `T` for Copy types
+    Copy,
+    /// `&T`
+    Ref,
+    /// `&mut T`
+    Mut,
+    /// `T`, the callee keeps or rebinds it
+    Owned,
+}
+
+#[derive(Default, Debug)]
+pub struct Own {
+    pub params: Vec<Vec<Mode>>,
+    /// owned params that are only rebound (never stored or mutated): callers may clone
+    pub owned_local: Vec<Vec<bool>>,
+    pub self_mut: Vec<bool>,
+    /// returns a copy of something reachable from a parameter or `self`
+    pub ret_alias: Vec<bool>,
+    /// Var expressions whose value is moved
+    pub moves: HashSet<u32>,
+    /// variables that need `mut`
+    pub mut_vars: Vec<HashSet<VarId>>,
+    /// loop variables assigned in the body
+    pub rebound: Vec<HashSet<VarId>>,
+    /// for statements that iterate with `iter_mut`
+    pub iter_mut: HashSet<u32>,
+    /// variables live at the head of a loop (stmt id → vars)
+    pub loop_live: HashMap<u32, HashSet<VarId>>,
+    pub immutable: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Step {
+    Index,
+    Field(String),
+    Tuple(usize),
+}
+
+type Path = Vec<Step>;
+
+#[derive(Clone, Debug)]
+struct Mutation {
+    /// the variable written in the source (a loop variable maps to `root`)
+    via: VarId,
+    root: VarId,
+    path: Path,
+    deep: bool,
+    pos: u32,
+    line: u32,
+}
+
+#[derive(Clone, Debug)]
+enum Dest {
+    /// consumed right away
+    Temp,
+    /// bound to a local variable
+    Local(VarId),
+    /// stored in a container / object / owned parameter
+    Escape,
+    Return,
+}
+
+pub fn analyze(p: &Program) -> Res<Own> {
+    let mut o = Own {
+        params: p
+            .funcs
+            .iter()
+            .map(|f| f.params.iter().map(|q| if f.vars[q.var].ty.is_copy() { Mode::Copy } else { Mode::Ref }).collect())
+            .collect(),
+        owned_local: p.funcs.iter().map(|f| vec![false; f.params.len()]).collect(),
+        self_mut: vec![false; p.funcs.len()],
+        ret_alias: vec![false; p.funcs.len()],
+        mut_vars: vec![HashSet::new(); p.funcs.len()],
+        rebound: vec![HashSet::new(); p.funcs.len()],
+        immutable: vec![false; p.classes.len()],
+        ..Default::default()
+    };
+    class_immutability(p, &mut o);
+    // parameter modes: iterate to a fixpoint (calls propagate &mut)
+    loop {
+        let mut changed = false;
+        for fid in 0..p.funcs.len() {
+            let f = &p.funcs[fid];
+            let (modes, self_m, ret_alias, self_escapes) = {
+                let mut a = Fn::new(p, &o, fid);
+                a.collect()?;
+                let mut modes = vec![];
+                for (i, q) in f.params.iter().enumerate() {
+                    if o.params[fid][i] == Mode::Copy {
+                        modes.push((Mode::Copy, false));
+                        continue;
+                    }
+                    let mutated = a.muts.iter().any(|m| m.root == q.var);
+                    let escapes = a.escaped.contains(&q.var);
+                    let rebound = a.assigned.get(&q.var).copied().unwrap_or(0) > 0;
+                    let m = if escapes || rebound {
+                        Mode::Owned
+                    } else if mutated {
+                        Mode::Mut
+                    } else {
+                        Mode::Ref
+                    };
+                    modes.push((m, m == Mode::Owned && !escapes && !mutated));
+                }
+                let self_m = f.self_var.map(|sv| a.muts.iter().any(|m| m.root == sv) && !f.is_init).unwrap_or(false);
+                let esc = f.self_var.map(|sv| a.escaped.contains(&sv)).unwrap_or(false);
+                (modes, self_m, a.ret_alias, esc)
+            };
+            if self_escapes {
+                return err(f.line, "`self` cannot be stored or returned")
+                    .map_err(|e| e.hint("return a copy of the fields you need"));
+            }
+            for (i, (m, local)) in modes.into_iter().enumerate() {
+                if m != o.params[fid][i] || local != o.owned_local[fid][i] {
+                    o.params[fid][i] = m;
+                    o.owned_local[fid][i] = local;
+                    changed = true;
+                }
+            }
+            if self_m != o.self_mut[fid] {
+                o.self_mut[fid] = self_m;
+                changed = true;
+            }
+            if ret_alias != o.ret_alias[fid] {
+                o.ret_alias[fid] = ret_alias;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for fid in 0..p.funcs.len() {
+        let (moves, muts, rebound, iter_mut, loop_live) = {
+            let mut a = Fn::new(p, &o, fid);
+            a.collect()?;
+            a.check()?;
+            a.results()
+        };
+        o.moves.extend(moves);
+        o.mut_vars[fid] = muts;
+        o.rebound[fid] = rebound;
+        o.iter_mut.extend(iter_mut);
+        o.loop_live.extend(loop_live);
+    }
+    Ok(o)
+}
+
+/// A class is immutable when no field is ever assigned outside `__init__`
+/// and all field types are immutable.
+fn class_immutability(p: &Program, o: &mut Own) {
+    let mut assigned: HashSet<ClassId> = HashSet::new();
+    fn walk(p: &Program, f: &Func, s: &[Stmt], out: &mut HashSet<ClassId>) {
+        for st in s {
+            let mut targets: Vec<&Expr> = vec![];
+            match &st.kind {
+                StmtKind::Assign(t, _) => collect_places(t, &mut targets),
+                StmtKind::AugAssign(t, _, _) => targets.push(t),
+                _ => {}
+            }
+            for t in targets {
+                let mut e = t;
+                loop {
+                    match &e.kind {
+                        ExprKind::Field(b, _) => {
+                            if let Ty::Class(c) = &b.ty {
+                                let in_init = f.is_init && f.class == Some(*c)
+                                    && matches!(b.kind, ExprKind::Var(v) if Some(v) == f.self_var);
+                                if !in_init {
+                                    out.insert(*c);
+                                }
+                            }
+                            e = b;
+                        }
+                        ExprKind::Index(b, _) | ExprKind::TupleField(b, _) => e = b,
+                        _ => break,
+                    }
+                }
+            }
+            match &st.kind {
+                StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
+                    walk(p, f, a, out);
+                    walk(p, f, b, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    for f in &p.funcs {
+        walk(p, f, &f.body, &mut assigned);
+    }
+    for (i, c) in p.classes.iter().enumerate() {
+        o.immutable[i] = c.frozen || !assigned.contains(&i);
+    }
+    // field types
+    loop {
+        let mut changed = false;
+        for (i, c) in p.classes.iter().enumerate() {
+            if o.immutable[i] && !c.fields.iter().all(|f| immutable_ty(&f.ty, &o.immutable)) {
+                o.immutable[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn collect_places<'a>(t: &'a Target, out: &mut Vec<&'a Expr>) {
+    match t {
+        Target::Var(_) => {}
+        Target::Place(e) => out.push(e),
+        Target::Tuple(v) => v.iter().for_each(|t| collect_places(t, out)),
+    }
+}
+
+pub fn immutable_ty(t: &Ty, classes: &[bool]) -> bool {
+    match t {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::None => true,
+        Ty::Tuple(ts) => ts.iter().all(|t| immutable_ty(t, classes)),
+        Ty::Class(c) => classes[*c],
+        _ => false,
+    }
+}
+
+fn prefix(a: &Path, b: &Path) -> bool {
+    a.len() <= b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
+/// Methods of builtin types that modify their receiver.
+fn mutating(name: &str) -> bool {
+    matches!(
+        name,
+        "list.append" | "list.extend" | "list.insert" | "list.pop" | "list.pop_at" | "list.remove"
+            | "list.sort" | "list.reverse" | "list.clear" | "list.swap" | "dict.pop" | "dict.pop_default"
+            | "dict.setdefault" | "dict.clear" | "dict.update" | "set.add" | "set.remove"
+            | "set.discard" | "set.clear"
+    )
+}
+
+/// Per-function analysis.
+struct Fn<'a> {
+    p: &'a Program,
+    o: &'a Own,
+    fid: FuncId,
+    f: &'a Func,
+    /// pre-order position of each statement and the end of its subtree
+    pos: HashMap<u32, (u32, u32)>,
+    loops: Vec<(u32, u32)>,
+    cur_pos: u32,
+    cur_stmt: u32,
+    muts: Vec<Mutation>,
+    escaped: HashSet<VarId>,
+    assigned: HashMap<VarId, u32>,
+    ret_alias: bool,
+    /// loop variable → (root, path) it borrows from
+    origin: HashMap<VarId, (VarId, Path)>,
+    /// variables that hold a copy of a value still reachable elsewhere
+    alias_src: HashMap<VarId, Vec<(VarId, Path)>>,
+    pending: Vec<(VarId, Path, Option<VarId>, u32, u32)>,
+    live_out: HashMap<u32, HashSet<VarId>>,
+    loop_live: HashMap<u32, HashSet<VarId>>,
+    moves: HashSet<u32>,
+    iter_mut: HashSet<u32>,
+    in_closure: u32,
+    /// for loops: stmt id → (iterated root/path, loop vars)
+    loop_iters: Vec<(u32, Option<(VarId, Path)>, Vec<VarId>, bool)>,
+    errors: Vec<Error>,
+}
+
+impl<'a> Fn<'a> {
+    fn new(p: &'a Program, o: &'a Own, fid: FuncId) -> Self {
+        Fn {
+            p,
+            o,
+            fid,
+            f: &p.funcs[fid],
+            pos: HashMap::new(),
+            loops: vec![],
+            cur_pos: 0,
+            cur_stmt: 0,
+            muts: vec![],
+            escaped: HashSet::new(),
+            assigned: HashMap::new(),
+            ret_alias: false,
+            origin: HashMap::new(),
+            alias_src: HashMap::new(),
+            pending: vec![],
+            live_out: HashMap::new(),
+            loop_live: HashMap::new(),
+            moves: HashSet::new(),
+            iter_mut: HashSet::new(),
+            in_closure: 0,
+            loop_iters: vec![],
+            errors: vec![],
+        }
+    }
+
+    fn imm(&self, t: &Ty) -> bool {
+        immutable_ty(t, &self.o.immutable)
+    }
+
+    fn results(self) -> (HashSet<u32>, HashSet<VarId>, HashSet<VarId>, HashSet<u32>, HashMap<u32, HashSet<VarId>>) {
+        // variables whose object is modified (or borrowed mutably)
+        let mut muts: HashSet<VarId> = self.muts.iter().map(|m| m.root).collect();
+        let mut rebound = HashSet::new();
+        for v in self.assigned.keys() {
+            match self.f.vars[*v].kind {
+                VarKind::Bound => {
+                    rebound.insert(*v);
+                }
+                VarKind::Param => {
+                    muts.insert(*v);
+                }
+                _ => {}
+            }
+        }
+        (self.moves, muts, rebound, self.iter_mut, self.loop_live)
+    }
+
+    // ------------------------------------------------------------ positions
+
+    fn number(&mut self, s: &[Stmt], n: &mut u32) {
+        for st in s {
+            *n += 1;
+            let start = *n;
+            match &st.kind {
+                StmtKind::If(_, a, b) => {
+                    self.number(a, n);
+                    self.number(b, n);
+                }
+                StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
+                    self.number(a, n);
+                    self.loops.push((start, *n));
+                    self.number(b, n);
+                }
+                _ => {}
+            }
+            self.pos.insert(st.id, (start, *n));
+        }
+    }
+
+    /// Can something at `q` happen after something at `p`?
+    fn after(&self, p: u32, q: u32) -> bool {
+        q >= p || self.loops.iter().any(|&(a, b)| a <= p && p <= b && a <= q && q <= b)
+    }
+
+    // ------------------------------------------------------------- collect
+
+    fn collect(&mut self) -> Res<()> {
+        let mut n = 0;
+        self.number(&self.f.body, &mut n);
+        self.liveness();
+        let f = self.f;
+        self.block(&f.body);
+        if let Some(e) = self.errors.first() {
+            return Err(e.clone());
+        }
+        Ok(())
+    }
+
+    fn block(&mut self, s: &[Stmt]) {
+        for st in s {
+            self.stmt(st);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) {
+        self.cur_pos = self.pos[&s.id].0;
+        self.cur_stmt = s.id;
+        match &s.kind {
+            StmtKind::Expr(e) => self.expr(e),
+            StmtKind::Assign(t, v) => {
+                self.expr(v);
+                self.target_exprs(t);
+                self.assign(t, v, s);
+            }
+            StmtKind::AugAssign(t, op, v) => {
+                self.expr(t);
+                self.expr(v);
+                if let Some((r, mut path)) = self.place(t) {
+                    // `xs[i] += 1` modifies xs; `xs += ys` modifies xs itself
+                    if !matches!(t.ty, Ty::List(_) | Ty::Set(_) | Ty::Dict(..)) || matches!(t.kind, ExprKind::Index(..) | ExprKind::Field(..)) {
+                        path.pop();
+                    }
+                    self.mutate(r, path, false, s.line);
+                }
+                if matches!(t.ty, Ty::List(_)) && *op == BinOp::Add {
+                    // elements of the right side are stored
+                    self.store_elements(v, s.line);
+                }
+            }
+            StmtKind::AugVar(v, _, e) => {
+                self.expr(e);
+                *self.assigned.entry(*v).or_default() += 1;
+            }
+            StmtKind::If(c, a, b) => {
+                self.expr(c);
+                self.block(a);
+                self.block(b);
+            }
+            StmtKind::While(c, a, b) => {
+                self.expr(c);
+                self.block(a);
+                self.block(b);
+            }
+            StmtKind::For(t, it, body, orelse) => {
+                self.iter(it);
+                let src = self.iter_source(it);
+                let mut vars = vec![];
+                t.vars(&mut vars);
+                self.bind_origins(t, it);
+                let before = self.muts.len();
+                self.block(body);
+                // loop variables that are modified → iter_mut
+                let direct: Vec<VarId> = vars
+                    .iter()
+                    .copied()
+                    .filter(|v| !self.f.vars[*v].ty.is_copy() && self.muts[before..].iter().any(|m| m.via == *v))
+                    .collect();
+                if !direct.is_empty() {
+                    self.iter_mut.insert(s.id);
+                }
+                self.loop_iters.push((s.id, src, vars, !direct.is_empty()));
+                self.block(orelse);
+            }
+            StmtKind::Return(Some(e)) => {
+                self.expr(e);
+                self.owned(e, Dest::Return, s.line);
+            }
+            StmtKind::Raise(_, Some(e)) => self.expr(e),
+            StmtKind::Assert(c, m) => {
+                self.expr(c);
+                if let Some(m) = m {
+                    self.expr(m)
+                }
+            }
+            StmtKind::Del(e) => {
+                self.expr(e);
+                if let ExprKind::Index(b, _) = &e.kind {
+                    if let Some((r, p)) = self.place(b) {
+                        self.mutate(r, p, false, s.line);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn target_exprs(&mut self, t: &Target) {
+        match t {
+            Target::Var(_) => {}
+            Target::Place(e) => e.children(&mut |c| self.expr(c)),
+            Target::Tuple(v) => v.iter().for_each(|t| self.target_exprs(t)),
+        }
+    }
+
+    fn assign(&mut self, t: &Target, v: &Expr, s: &Stmt) {
+        match t {
+            Target::Var(w) => {
+                *self.assigned.entry(*w).or_default() += 1;
+                self.alias_src.remove(w);
+                self.owned(v, Dest::Local(*w), s.line);
+            }
+            Target::Place(pl) => {
+                if let Some((r, mut path)) = self.place(pl) {
+                    path.pop();
+                    // in __init__, `self.f = ...` builds the object
+                    if !(self.f.is_init && Some(r) == self.f.self_var && path.is_empty()) {
+                        self.mutate(r, path, false, s.line);
+                    }
+                }
+                self.owned(v, Dest::Escape, s.line);
+            }
+            Target::Tuple(ts) => {
+                if let ExprKind::Tuple(es) = &v.kind {
+                    for (t, e) in ts.iter().zip(es.iter()) {
+                        self.assign(t, e, s);
+                    }
+                } else {
+                    let mut vs = vec![];
+                    t.vars(&mut vs);
+                    for w in vs {
+                        *self.assigned.entry(w).or_default() += 1;
+                        self.alias_src.remove(&w);
+                    }
+                    let mut pls = vec![];
+                    collect_places(t, &mut pls);
+                    for pl in pls {
+                        if let Some((r, mut path)) = self.place(pl) {
+                            path.pop();
+                            self.mutate(r, path, false, s.line);
+                        }
+                    }
+                    self.owned(v, Dest::Escape, s.line);
+                }
+            }
+        }
+    }
+
+    fn mutate(&mut self, root: VarId, path: Path, deep: bool, line: u32) {
+        // through loop variables to what they borrow
+        let via = root;
+        let (root, path) = self.resolve(root, path);
+        let pos = self.cur_pos;
+        self.muts.push(Mutation { via, root, path, deep, pos, line });
+    }
+
+    fn resolve(&self, root: VarId, path: Path) -> (VarId, Path) {
+        match self.origin.get(&root) {
+            Some((r, p)) => {
+                let mut np = p.clone();
+                np.extend(path);
+                self.resolve(*r, np)
+            }
+            None => (root, path),
+        }
+    }
+
+    /// Root variable and path of a place expression.
+    fn place(&self, e: &Expr) -> Option<(VarId, Path)> {
+        match &e.kind {
+            ExprKind::Var(v) => Some((*v, vec![])),
+            ExprKind::Index(b, _) => {
+                let (r, mut p) = self.place(b)?;
+                if matches!(b.ty, Ty::Str) {
+                    return None;
+                }
+                p.push(Step::Index);
+                Some((r, p))
+            }
+            ExprKind::Field(b, f) => {
+                let (r, mut p) = self.place(b)?;
+                p.push(Step::Field(f.clone()));
+                Some((r, p))
+            }
+            ExprKind::TupleField(b, i) => {
+                let (r, mut p) = self.place(b)?;
+                p.push(Step::Tuple(*i));
+                Some((r, p))
+            }
+            ExprKind::Builtin("dict.setdefault", a) => {
+                let (r, mut p) = self.place(&a[0])?;
+                p.push(Step::Index);
+                Some((r, p))
+            }
+            _ => None,
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::Comp(c) => {
+                self.in_closure += 1;
+                for g in &c.gens {
+                    self.iter(&g.iter);
+                    self.bind_origins(&g.target, &g.iter);
+                    for c in &g.conds {
+                        self.expr(c);
+                    }
+                }
+                self.expr(&c.elt);
+                if let Some(v) = &c.val {
+                    self.expr(v);
+                }
+                let dest = if c.kind == CompKind::Gen { Dest::Temp } else { Dest::Escape };
+                self.owned(&c.elt, dest.clone(), e.line);
+                if let Some(v) = &c.val {
+                    self.owned(v, dest, e.line);
+                }
+                self.in_closure -= 1;
+                return;
+            }
+            ExprKind::Lambda(_, b) => {
+                self.in_closure += 1;
+                self.expr(b);
+                self.in_closure -= 1;
+                return;
+            }
+            ExprKind::Iter(it) => {
+                self.iter(it);
+                return;
+            }
+            _ => {}
+        }
+        e.children(&mut |c| self.expr(c));
+        match &e.kind {
+            ExprKind::Call(fid, args) => self.call(*fid, None, args, e),
+            ExprKind::Method(r, fid, args) => self.call(*fid, Some(r), args, e),
+            ExprKind::New(c, args) => {
+                if let Some(init) = self.p.classes[*c].init {
+                    self.call(init, None, args, e);
+                } else {
+                    for a in args {
+                        self.owned(a, Dest::Escape, e.line);
+                    }
+                }
+            }
+            ExprKind::List(v) | ExprKind::Set(v) | ExprKind::Tuple(v) => {
+                for a in v {
+                    self.owned(a, Dest::Escape, e.line);
+                }
+            }
+            ExprKind::Dict(v) => {
+                for (k, a) in v {
+                    self.owned(k, Dest::Escape, e.line);
+                    self.owned(a, Dest::Escape, e.line);
+                }
+            }
+            ExprKind::Bin(BinOp::Mul, a, _) if matches!(a.ty, Ty::List(_)) => {
+                if let Ty::List(t) = &a.ty {
+                    if !self.imm(t) {
+                        self.errors.push(Error::new(e.line, "`list * n` repeats the same object n times")
+                            .hint("build the list with a comprehension: [[0] * m for _ in range(n)]"));
+                    }
+                }
+            }
+            ExprKind::Builtin(name, args) => self.builtin(name, args, e),
+            _ => {}
+        }
+    }
+
+    fn builtin(&mut self, name: &str, args: &[Expr], e: &Expr) {
+        if mutating(name) {
+            if let Some((r, p)) = self.place(&args[0]) {
+                self.mutate(r, p, false, e.line);
+            }
+        }
+        match name {
+            "list.append" | "set.add" => self.owned(&args[1], Dest::Escape, e.line),
+            "list.insert" => self.owned(&args[2], Dest::Escape, e.line),
+            "dict.setdefault" => {
+                self.owned(&args[1], Dest::Escape, e.line);
+                self.owned(&args[2], Dest::Escape, e.line);
+            }
+            "list.extend" => self.store_elements(&args[1], e.line),
+            "dict.update" => self.store_elements(&args[1], e.line),
+            _ => {}
+        }
+    }
+
+    /// The elements of an iterable are stored somewhere else.
+    fn store_elements(&mut self, it: &Expr, line: u32) {
+        let elem = match &it.ty {
+            Ty::List(t) | Ty::Set(t) => (**t).clone(),
+            Ty::Dict(_, v) => (**v).clone(),
+            t => t.clone(),
+        };
+        if self.imm(&elem) {
+            return;
+        }
+        let inner = match &it.kind {
+            ExprKind::Iter(i) => match &**i {
+                Iter::Over(x) | Iter::Values(x) | Iter::Items(x) => Some(x),
+                _ => None,
+            },
+            _ => Some(it),
+        };
+        if let Some(x) = inner {
+            if let Some((r, _)) = self.place(x) {
+                if self.movable_once(x) {
+                    self.moves.insert(x.id);
+                    return;
+                }
+                let _ = r;
+                self.errors.push(Error::new(line, "the elements would be shared between two lists")
+                    .hint("copy them: xs.extend([r.copy() for r in ys])"));
+            }
+        }
+    }
+
+    fn call(&mut self, fid: FuncId, recv: Option<&Expr>, args: &[Expr], e: &Expr) {
+        let callee = &self.p.funcs[fid];
+        if let Some(r) = recv {
+            if self.o.self_mut[fid] {
+                if let Some((root, p)) = self.place(r) {
+                    self.mutate(root, p, true, e.line);
+                }
+            }
+        }
+        let mut mut_roots: Vec<VarId> = vec![];
+        for (i, a) in args.iter().enumerate() {
+            match self.o.params[fid][i] {
+                Mode::Mut => {
+                    if let Some((root, p)) = self.place(a) {
+                        let (rr, _) = self.resolve(root, vec![]);
+                        mut_roots.push(rr);
+                        self.mutate(root, p, true, e.line);
+                    }
+                }
+                Mode::Owned => {
+                    let d = if self.o.owned_local[fid][i] { Dest::Temp } else { Dest::Escape };
+                    self.owned(a, d, e.line);
+                }
+                _ => {}
+            }
+        }
+        // a value passed as &mut must not be passed again
+        for (i, a) in args.iter().enumerate() {
+            if self.o.params[fid][i] == Mode::Mut {
+                continue;
+            }
+            let mut vs = vec![];
+            uses(a, &mut vs);
+            for v in vs {
+                let (rr, _) = self.resolve(v, vec![]);
+                if mut_roots.contains(&rr) && !a.ty.is_copy() {
+                    self.errors.push(Error::new(e.line, format!(
+                        "`{}` is passed to {}() twice while being modified",
+                        self.f.vars[v].name, callee.name)));
+                }
+            }
+        }
+        if let Some(r) = recv {
+            if self.o.self_mut[fid] {
+                for a in args {
+                    let mut vs = vec![];
+                    uses(a, &mut vs);
+                    if let Some((root, _)) = self.place(r) {
+                        let (rr, _) = self.resolve(root, vec![]);
+                        if vs.iter().any(|v| self.resolve(*v, vec![]).0 == rr) && !a.ty.is_copy() {
+                            self.errors.push(Error::new(e.line, format!(
+                                "`{}.{}()` modifies `{}` and also reads it in an argument",
+                                self.f.vars[root].name, callee.name, self.f.vars[root].name)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The value of `e` is needed as an owned value going to `dest`.
+    fn owned(&mut self, e: &Expr, dest: Dest, line: u32) {
+        if e.ty.is_copy() {
+            return;
+        }
+        if let ExprKind::IfExp(_, a, b) = &e.kind {
+            self.owned(a, dest.clone(), line);
+            self.owned(b, dest, line);
+            return;
+        }
+        // a whole variable that dies here is moved
+        if let ExprKind::Var(v) = &e.kind {
+            let var = &self.f.vars[*v];
+            let owned_var = match var.kind {
+                VarKind::Local => true,
+                VarKind::Param => {
+                    let i = self.f.params.iter().position(|q| q.var == *v).unwrap();
+                    self.o.params[self.fid][i] == Mode::Owned
+                }
+                VarKind::Bound => !self.origin.contains_key(v),
+                VarKind::SelfParam => false,
+            };
+            if matches!(var.kind, VarKind::Param | VarKind::SelfParam) && matches!(dest, Dest::Escape | Dest::Return) {
+                self.escaped.insert(*v);
+            }
+            if owned_var && self.movable_once(e) {
+                self.moves.insert(e.id);
+                // a moved alias carries its sources along
+                if let Some(srcs) = self.alias_src.get(v).cloned() {
+                    match dest {
+                        Dest::Local(w) => {
+                            for (r, p) in &srcs {
+                                self.pending.push((*r, p.clone(), Some(w), self.cur_pos, line));
+                            }
+                            self.alias_src.insert(w, srcs);
+                        }
+                        Dest::Escape => self.errors.push(Error::new(line, format!(
+                            "`{}` shares its value with another variable and cannot be stored",
+                            var.name)).hint("store a copy: .copy()")),
+                        _ => {}
+                    }
+                }
+                return;
+            }
+        }
+        if self.imm(&e.ty) {
+            return;
+        }
+        let sources = self.sources(e);
+        if sources.is_empty() {
+            return;
+        }
+        match dest {
+            Dest::Temp => {}
+            Dest::Local(w) => {
+                for (r, p) in &sources {
+                    self.pending.push((*r, p.clone(), Some(w), self.cur_pos, line));
+                }
+                self.alias_src.insert(w, sources);
+            }
+            Dest::Return => {
+                for (r, _) in &sources {
+                    if matches!(self.f.vars[*r].kind, VarKind::Param | VarKind::SelfParam) {
+                        self.ret_alias = true;
+                    }
+                }
+            }
+            Dest::Escape => {
+                let (r, _) = &sources[0];
+                let name = &self.f.vars[*r].name;
+                self.errors.push(
+                    Error::new(line, format!("this stores a value that is still reachable through `{}`", name))
+                        .hint("Python would share one object between both places; store a copy (.copy(), list(...), a new object)"),
+                );
+            }
+        }
+    }
+
+    /// Where the value of a non-fresh expression lives.
+    fn sources(&self, e: &Expr) -> Vec<(VarId, Path)> {
+        let elem_mut = |t: &Ty| match t {
+            Ty::List(x) | Ty::Set(x) => !self.imm(x),
+            Ty::Dict(k, v) => !self.imm(k) || !self.imm(v),
+            _ => true,
+        };
+        let mut out = vec![];
+        match &e.kind {
+            ExprKind::Var(_) | ExprKind::Index(..) | ExprKind::Field(..) | ExprKind::TupleField(..) => {
+                if let Some((r, p)) = self.place(e) {
+                    let (r, p) = self.resolve(r, p);
+                    if let Some(srcs) = self.alias_src.get(&r) {
+                        out.extend(srcs.iter().cloned());
+                    }
+                    out.push((r, p));
+                }
+            }
+            ExprKind::Slice(b, ..) if elem_mut(&e.ty) => {
+                for (r, mut p) in self.sources(b) {
+                    p.push(Step::Index);
+                    out.push((r, p));
+                }
+            }
+            ExprKind::Builtin("list.copy" | "dict.copy" | "set.copy", a) if elem_mut(&e.ty) => {
+                for (r, mut p) in self.sources(&a[0]) {
+                    p.push(Step::Index);
+                    out.push((r, p));
+                }
+            }
+            ExprKind::Bin(BinOp::Add, a, b) if matches!(e.ty, Ty::List(_)) && elem_mut(&e.ty) => {
+                for x in [a, b] {
+                    for (r, mut p) in self.sources(x) {
+                        p.push(Step::Index);
+                        out.push((r, p));
+                    }
+                }
+            }
+            ExprKind::Builtin("dict.get", a) => {
+                for (r, mut p) in self.sources(&a[0]) {
+                    p.push(Step::Index);
+                    out.push((r, p));
+                }
+            }
+            ExprKind::Builtin("list" | "set" | "sorted" | "min_iter" | "max_iter", a) => {
+                if let ExprKind::Iter(it) = &a[0].kind {
+                    let elem = match &a[0].ty {
+                        t => t.clone(),
+                    };
+                    if !self.imm(&elem) {
+                        if let Some((r, mut p)) = self.iter_source(it) {
+                            if !matches!(e.kind, ExprKind::Builtin("min_iter" | "max_iter", _)) || true {
+                                p.push(Step::Index);
+                            }
+                            out.push((r, p));
+                        }
+                    }
+                }
+            }
+            ExprKind::Call(fid, args) | ExprKind::Method(_, fid, args) if self.o.ret_alias[*fid] => {
+                if let ExprKind::Method(r, _, _) = &e.kind {
+                    out.extend(self.sources(r));
+                }
+                for a in args {
+                    if !a.ty.is_copy() {
+                        out.extend(self.sources(a));
+                    }
+                }
+            }
+            ExprKind::IfExp(_, a, b) => {
+                out.extend(self.sources(a));
+                out.extend(self.sources(b));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn iter_source(&self, it: &Iter) -> Option<(VarId, Path)> {
+        match it {
+            Iter::Over(x) | Iter::Keys(x) | Iter::Values(x) | Iter::Items(x) => {
+                let (r, p) = self.place(x)?;
+                Some(self.resolve(r, p))
+            }
+            Iter::Enumerate(i, _) | Iter::Reversed(i) => self.iter_source(i),
+            _ => None,
+        }
+    }
+
+    fn iter(&mut self, it: &Iter) {
+        match it {
+            Iter::Gen(e) => self.expr(e),
+            _ => it.exprs(&mut |x| self.expr(x)),
+        }
+    }
+
+    /// Loop variables bound by reference borrow from the iterated value.
+    fn bind_origins(&mut self, t: &Target, it: &Iter) {
+        fn go(f: &mut Fn, t: &Target, it: &Iter) {
+            match (t, it) {
+                (_, Iter::Range(..)) | (_, Iter::Gen(_)) => {}
+                (Target::Var(v), Iter::Over(x) | Iter::Values(x)) => {
+                    if matches!(x.ty, Ty::Str) {
+                        return;
+                    }
+                    if let Some((r, mut p)) = f.place(x) {
+                        p.push(Step::Index);
+                        f.origin.insert(*v, (r, p));
+                    }
+                }
+                (Target::Var(_), Iter::Keys(_)) => {}
+                (Target::Tuple(ts), Iter::Items(x)) if ts.len() == 2 => {
+                    if let (Target::Var(v), Some((r, mut p))) = (&ts[1], f.place(x)) {
+                        p.push(Step::Index);
+                        f.origin.insert(*v, (r, p));
+                    }
+                }
+                (Target::Tuple(ts), Iter::Enumerate(i, _)) if ts.len() == 2 => go(f, &ts[1], i),
+                (Target::Tuple(ts), Iter::Zip(its)) if ts.len() == its.len() => {
+                    for (t, i) in ts.iter().zip(its.iter()) {
+                        go(f, t, i);
+                    }
+                }
+                (Target::Tuple(ts), Iter::Over(x)) => {
+                    // list of tuples: each component borrows from the element
+                    if let Some((r, mut p)) = f.place(x) {
+                        p.push(Step::Index);
+                        for (i, t) in ts.iter().enumerate() {
+                            if let Target::Var(v) = t {
+                                let mut q = p.clone();
+                                q.push(Step::Tuple(i));
+                                f.origin.insert(*v, (r, q));
+                            }
+                        }
+                    }
+                }
+                (t, Iter::Reversed(i)) => go(f, t, i),
+                _ => {}
+            }
+        }
+        go(self, t, it)
+    }
+
+    // ------------------------------------------------------------ liveness
+
+    fn liveness(&mut self) {
+        let body = &self.f.body;
+        let mut ctx = vec![];
+        self.live_block(body, HashSet::new(), &mut ctx);
+    }
+
+    fn live_block(&mut self, s: &[Stmt], out: HashSet<VarId>, ctx: &mut Vec<(HashSet<VarId>, HashSet<VarId>)>) -> HashSet<VarId> {
+        let mut live = out;
+        for st in s.iter().rev() {
+            self.live_out.insert(st.id, live.clone());
+            live = self.live_stmt(st, live, ctx);
+        }
+        live
+    }
+
+    fn live_stmt(&mut self, s: &Stmt, out: HashSet<VarId>, ctx: &mut Vec<(HashSet<VarId>, HashSet<VarId>)>) -> HashSet<VarId> {
+        let mut u = vec![];
+        match &s.kind {
+            StmtKind::Expr(e) | StmtKind::Del(e) => {
+                uses(e, &mut u);
+                out.into_iter().chain(u).collect()
+            }
+            StmtKind::Assign(t, e) => {
+                let mut d = vec![];
+                t.vars(&mut d);
+                let mut live: HashSet<VarId> = out.into_iter().filter(|v| !d.contains(v)).collect();
+                uses(e, &mut u);
+                target_uses(t, &mut u);
+                live.extend(u);
+                live
+            }
+            StmtKind::AugAssign(t, _, e) => {
+                uses(t, &mut u);
+                uses(e, &mut u);
+                out.into_iter().chain(u).collect()
+            }
+            StmtKind::AugVar(v, _, e) => {
+                uses(e, &mut u);
+                u.push(*v);
+                out.into_iter().chain(u).collect()
+            }
+            StmtKind::If(c, a, b) => {
+                uses(c, &mut u);
+                let la = self.live_block(a, out.clone(), ctx);
+                let lb = self.live_block(b, out, ctx);
+                la.into_iter().chain(lb).chain(u).collect()
+            }
+            StmtKind::While(c, body, orelse) => {
+                uses(c, &mut u);
+                let le = self.live_block(orelse, out.clone(), ctx);
+                let mut head: HashSet<VarId> = le.iter().copied().chain(u.iter().copied()).collect();
+                loop {
+                    ctx.push((out.clone(), head.clone()));
+                    let lb = self.live_block(body, head.clone(), ctx);
+                    ctx.pop();
+                    let new: HashSet<VarId> = head.iter().copied().chain(lb).collect();
+                    if new == head {
+                        break;
+                    }
+                    head = new;
+                }
+                self.loop_live.insert(s.id, head.clone());
+                head
+            }
+            StmtKind::For(t, it, body, orelse) => {
+                let mut d = vec![];
+                t.vars(&mut d);
+                it.exprs(&mut |e| uses(e, &mut u));
+                let le = self.live_block(orelse, out.clone(), ctx);
+                // the iterated value is borrowed for the whole loop
+                let mut head: HashSet<VarId> = le.iter().copied().chain(u.iter().copied()).collect();
+                loop {
+                    ctx.push((out.clone(), head.clone()));
+                    let lb = self.live_block(body, head.clone(), ctx);
+                    ctx.pop();
+                    let new: HashSet<VarId> =
+                        head.iter().copied().chain(lb.into_iter().filter(|v| !d.contains(v))).collect();
+                    if new == head {
+                        break;
+                    }
+                    head = new;
+                }
+                self.loop_live.insert(s.id, head.clone());
+                head
+            }
+            StmtKind::Return(e) => {
+                if let Some(e) = e {
+                    uses(e, &mut u);
+                }
+                u.into_iter().collect()
+            }
+            StmtKind::Raise(_, e) => {
+                if let Some(e) = e {
+                    uses(e, &mut u);
+                }
+                u.into_iter().collect()
+            }
+            StmtKind::Assert(c, m) => {
+                uses(c, &mut u);
+                if let Some(m) = m {
+                    uses(m, &mut u);
+                }
+                out.into_iter().chain(u).collect()
+            }
+            StmtKind::Break => ctx.last().map(|c| c.0.clone()).unwrap_or_default(),
+            StmtKind::Continue => ctx.last().map(|c| c.1.clone()).unwrap_or_default(),
+            StmtKind::Pass => out,
+        }
+    }
+
+    /// `e` (a variable) is used exactly once in the current statement, outside
+    /// closures, and is dead afterwards.
+    fn movable_once(&self, e: &Expr) -> bool {
+        let ExprKind::Var(v) = e.kind else { return false };
+        if self.in_closure > 0 {
+            return false;
+        }
+        let s = self.find_stmt(self.cur_stmt);
+        let Some(s) = s else { return false };
+        let mut n = 0;
+        let mut count = |x: &Expr| {
+            let mut u = vec![];
+            uses(x, &mut u);
+            n += u.iter().filter(|w| **w == v).count();
+        };
+        match &s.kind {
+            StmtKind::Expr(x) | StmtKind::Return(Some(x)) => count(x),
+            StmtKind::Assign(t, x) => {
+                count(x);
+                let mut u = vec![];
+                target_uses(t, &mut u);
+                n += u.iter().filter(|w| **w == v).count();
+            }
+            StmtKind::AugAssign(t, _, x) => {
+                count(t);
+                count(x);
+            }
+            StmtKind::AugVar(w, _, x) => {
+                count(x);
+                if *w == v {
+                    n += 1;
+                }
+            }
+            _ => return false,
+        }
+        if n != 1 {
+            return false;
+        }
+        if matches!(s.kind, StmtKind::Return(_)) {
+            return true;
+        }
+        !self.live_out.get(&s.id).map(|l| l.contains(&v)).unwrap_or(true)
+    }
+
+    fn find_stmt(&self, id: u32) -> Option<&'a Stmt> {
+        fn go(s: &[Stmt], id: u32) -> Option<&Stmt> {
+            for st in s {
+                if st.id == id {
+                    return Some(st);
+                }
+                match &st.kind {
+                    StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
+                        if let Some(x) = go(a, id).or_else(|| go(b, id)) {
+                            return Some(x);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        go(&self.f.body, id)
+    }
+
+    // ---------------------------------------------------------------- check
+
+    fn check(&mut self) -> Res<()> {
+        // `for i in ...` over a local `i`: Python leaves the last item in `i`
+        for (b, l) in &self.f.shadows {
+            for (sid, _, vars, _) in &self.loop_iters {
+                if vars.contains(b) && self.live_out.get(sid).map(|s| s.contains(l)).unwrap_or(false) {
+                    let line = self.find_stmt(*sid).map(|s| s.line).unwrap_or(self.f.line);
+                    let n = &self.f.vars[*l].name;
+                    return Err(Error::new(line, format!("after this loop Python's `{}` holds the last item, not its earlier value", n))
+                        .hint("use a different name for the loop variable"));
+                }
+            }
+        }
+        // copies must not observe later modifications
+        for (root, path, dest, pos, line) in self.pending.clone() {
+            for m in &self.muts {
+                if !self.after(pos, m.pos) {
+                    continue;
+                }
+                let hit_src = m.root == root && (prefix(&path, &m.path) || (m.deep && prefix(&m.path, &path)));
+                let hit_dst = Some(m.root) == dest;
+                if hit_src || hit_dst {
+                    let src = &self.f.vars[root].name;
+                    let what = match dest {
+                        Some(d) => format!("`{}` and `{}`", self.f.vars[d].name, src),
+                        None => format!("`{}`", src),
+                    };
+                    return Err(Error::new(line, format!(
+                        "{} share one object in Python, and it is modified later (line {})", what, m.line))
+                        .hint("make an explicit copy (.copy(), list(...), [r.copy() for r in ...]) or avoid the second name"));
+                }
+            }
+        }
+        // iterating a value while modifying it
+        for (sid, src, vars, by_mut) in self.loop_iters.clone() {
+            let Some((root, path)) = src else { continue };
+            let (start, end) = self.pos[&sid];
+            for m in &self.muts {
+                if m.pos <= start || m.pos > end {
+                    continue;
+                }
+                if m.root == root && (prefix(&path, &m.path) || prefix(&m.path, &path)) {
+                    // modifications through the loop variable itself are fine
+                    let through_var = by_mut && m.path.len() > path.len();
+                    if through_var && vars.iter().any(|v| self.origin.contains_key(v)) {
+                        continue;
+                    }
+                    if m.path.len() > path.len() && !by_mut {
+                        // element modified through an index while iterating
+                    }
+                    return Err(Error::new(m.line, format!(
+                        "`{}` is modified while a loop iterates over it", self.f.vars[root].name))
+                        .hint("iterate over a copy (`for x in list(xs):`) or loop over indices"));
+                }
+            }
+            if by_mut {
+                // nothing else may touch the container while elements are borrowed mutably
+                let body_uses = self.uses_in_range(start, end, root, &vars);
+                if let Some(line) = body_uses {
+                    return Err(Error::new(line, format!(
+                        "`{}` is used inside a loop that modifies its elements", self.f.vars[root].name))
+                        .hint("loop over indices: for i in range(len(xs)): ..."));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Line of a use of `root` (other than through `vars`) inside a loop body.
+    fn uses_in_range(&self, start: u32, end: u32, root: VarId, vars: &[VarId]) -> Option<u32> {
+        let mut found = None;
+        let mut walk = |s: &Stmt, f: &Fn| {
+            let (p, _) = f.pos[&s.id];
+            if p <= start || p > end || found.is_some() {
+                return;
+            }
+            let mut u = vec![];
+            stmt_uses_shallow(s, &mut u);
+            for v in u {
+                if vars.contains(&v) {
+                    continue;
+                }
+                if f.resolve(v, vec![]).0 == root {
+                    found = Some(s.line);
+                }
+            }
+        };
+        fn all<'b>(s: &'b [Stmt], f: &Fn, w: &mut dyn FnMut(&Stmt, &Fn)) {
+            for st in s {
+                w(st, f);
+                match &st.kind {
+                    StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
+                        all(a, f, w);
+                        all(b, f, w);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        all(&self.f.body, self, &mut walk);
+        found
+    }
+}
+
+/// Variables used by an expression (including inside closures).
+pub fn uses(e: &Expr, out: &mut Vec<VarId>) {
+    if let ExprKind::Var(v) = e.kind {
+        out.push(v);
+    }
+    e.children(&mut |c| uses(c, out));
+}
+
+fn target_uses(t: &Target, out: &mut Vec<VarId>) {
+    match t {
+        Target::Var(_) => {}
+        Target::Place(e) => uses(e, out),
+        Target::Tuple(v) => v.iter().for_each(|t| target_uses(t, out)),
+    }
+}
+
+/// Uses in the statement's own expressions (not nested statements).
+fn stmt_uses_shallow(s: &Stmt, out: &mut Vec<VarId>) {
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Del(e) | StmtKind::Return(Some(e)) | StmtKind::Raise(_, Some(e)) => uses(e, out),
+        StmtKind::Assign(t, e) => {
+            uses(e, out);
+            target_uses(t, out);
+        }
+        StmtKind::AugAssign(t, _, e) => {
+            uses(t, out);
+            uses(e, out);
+        }
+        StmtKind::AugVar(v, _, e) => {
+            out.push(*v);
+            uses(e, out);
+        }
+        StmtKind::If(c, ..) | StmtKind::While(c, ..) => uses(c, out),
+        StmtKind::For(_, it, ..) => it.exprs(&mut |e| uses(e, out)),
+        StmtKind::Assert(c, m) => {
+            uses(c, out);
+            if let Some(m) = m {
+                uses(m, out);
+            }
+        }
+        _ => {}
+    }
+}
