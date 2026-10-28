@@ -19,6 +19,13 @@ pub enum Ty {
     Set(Box<Ty>),
     Tuple(Vec<Ty>),
     Class(ClassId),
+    /// `T | None`
+    Optional(Box<Ty>),
+    /// a caught exception (`except E as e`)
+    Exc,
+    /// exactly this class (`self` in a class that has subclasses); `Class(c)`
+    /// is c or any subclass
+    Obj(ClassId),
     /// Inference variable (only during `front`).
     Var(usize),
 }
@@ -30,6 +37,9 @@ impl Ty {
     pub fn set(t: Ty) -> Ty {
         Ty::Set(Box::new(t))
     }
+    pub fn opt(t: Ty) -> Ty {
+        Ty::Optional(Box::new(t))
+    }
     pub fn dict(k: Ty, v: Ty) -> Ty {
         Ty::Dict(Box::new(k), Box::new(v))
     }
@@ -38,6 +48,7 @@ impl Ty {
         match self {
             Ty::Int | Ty::Float | Ty::Bool | Ty::None => true,
             Ty::Tuple(ts) => ts.iter().all(|t| t.is_copy()),
+            Ty::Optional(t) => t.is_copy(),
             _ => false,
         }
     }
@@ -71,6 +82,9 @@ impl fmt::Display for TyName<'_> {
                 write!(f, "]")
             }
             Ty::Class(c) => write!(f, "{}", p.classes[*c].name),
+            Ty::Optional(t) => write!(f, "{} | None", TyName(t, p)),
+            Ty::Obj(c) => write!(f, "{}", p.classes[*c].name),
+            Ty::Exc => write!(f, "Exception"),
             Ty::Var(_) => write!(f, "?"),
         }
     }
@@ -127,6 +141,19 @@ pub enum ExprKind {
     Bool(bool),
     Str(String),
     NoneLit,
+    /// the value `None` of an Optional type
+    NoneVal,
+    /// `T` → `T | None`
+    SomeOf(Box<Expr>),
+    /// a subclass value where a base class is expected
+    Upcast(Box<Expr>),
+    /// `isinstance(x, C)`; with a variable, `x` as a `C` in the narrowed branch
+    IsInst(Box<Expr>, ClassId, Option<VarId>),
+    /// `super().__init__(args)` (the base's __init__)
+    SuperInit(FuncId, Vec<Expr>),
+    /// `x is None` (false) / `x is not None` (true); with a variable, the
+    /// value is bound to it in the narrowed branch
+    IsSome(Box<Expr>, bool, Option<VarId>),
     Var(VarId),
     Const(usize),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -240,6 +267,21 @@ pub enum StmtKind {
     Raise(String, Option<Expr>),
     Assert(Expr, Option<Expr>),
     Del(Expr),
+    /// `let Some(var) = place else { body }`: the body leaves the block
+    LetSome(VarId, Expr, Vec<Stmt>),
+    /// try / except / else / finally
+    Try(Vec<Stmt>, Vec<Handler>, Vec<Stmt>, Vec<Stmt>),
+    /// bare `raise` in a handler
+    Reraise(VarId),
+}
+
+#[derive(Clone, Debug)]
+pub struct Handler {
+    /// exception classes caught (`BaseException` for a bare `except:`)
+    pub kinds: Vec<String>,
+    /// the exception (named by `as`, or hidden)
+    pub var: VarId,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -249,6 +291,8 @@ pub enum VarKind {
     SelfParam,
     /// for-loop / comprehension / lambda variable
     Bound,
+    /// the value of an Optional place after `is not None`
+    Narrow,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +323,8 @@ pub struct Func {
     pub is_static: bool,
     /// loop variables that reuse the name of a local: (loop var, local)
     pub shadows: Vec<(VarId, VarId)>,
+    /// a method of a class with subclasses: the implementation of each class
+    pub dispatch: Vec<(ClassId, FuncId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +343,12 @@ pub struct Class {
     pub frozen: bool,
     pub init: Option<FuncId>,
     pub methods: Vec<(String, FuncId)>,
+    pub base: Option<ClassId>,
+    pub subs: Vec<ClassId>,
+    /// methods called on a value that may be any subclass
+    pub dispatch: Vec<(String, FuncId)>,
+    /// an exception class: (builtin exception it derives from)
+    pub exc: Option<String>,
 }
 
 impl Class {
@@ -323,22 +375,46 @@ pub struct Program {
     pub main: FuncId,
 }
 
+impl Program {
+    /// `x` is `a` or a subclass of it.
+    pub fn is_sub(&self, x: ClassId, a: ClassId) -> bool {
+        let mut c = Some(x);
+        while let Some(k) = c {
+            if k == a {
+                return true;
+            }
+            c = self.classes[k].base;
+        }
+        false
+    }
+    /// `c` and all its subclasses.
+    pub fn subtree(&self, c: ClassId) -> Vec<ClassId> {
+        let mut out = vec![c];
+        let mut i = 0;
+        while i < out.len() {
+            out.extend(self.classes[out[i]].subs.iter().copied());
+            i += 1;
+        }
+        out
+    }
+}
+
 impl Expr {
     /// Visit direct sub-expressions.
     pub fn children(&self, f: &mut dyn FnMut(&Expr)) {
         use ExprKind::*;
         match &self.kind {
-            Int(_) | Float(_) | Bool(_) | Str(_) | NoneLit | Var(_) | Const(_) => {}
+            Int(_) | Float(_) | Bool(_) | Str(_) | NoneLit | NoneVal | Var(_) | Const(_) => {}
             Bin(_, a, b) => {
                 f(a);
                 f(b)
             }
-            Unary(_, a) | ToFloat(a) | Field(a, _) | TupleField(a, _) => f(a),
+            Unary(_, a) | ToFloat(a) | Field(a, _) | TupleField(a, _) | SomeOf(a) | IsSome(a, _, _) | Upcast(a) | IsInst(a, _, _) => f(a),
             Cmp(a, rest) => {
                 f(a);
                 rest.iter().for_each(|(_, e)| f(e))
             }
-            And(v) | Or(v) | List(v) | Tuple(v) | Set(v) | Call(_, v) | New(_, v) | Builtin(_, v) => {
+            And(v) | Or(v) | List(v) | Tuple(v) | Set(v) | Call(_, v) | New(_, v) | Builtin(_, v) | SuperInit(_, v) => {
                 v.iter().for_each(|e| f(e))
             }
             IfExp(a, b, c) => {
@@ -382,6 +458,24 @@ impl Expr {
             }),
             Lambda(_, b) => f(b),
             Iter(it) => it.exprs(f),
+        }
+    }
+}
+
+impl Stmt {
+    /// Nested statement lists.
+    pub fn blocks(&self) -> Vec<&Vec<Stmt>> {
+        match &self.kind {
+            StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => vec![a, b],
+            StmtKind::LetSome(_, _, b) => vec![b],
+            StmtKind::Try(b, hs, e, f) => {
+                let mut v = vec![b];
+                v.extend(hs.iter().map(|h| &h.body));
+                v.push(e);
+                v.push(f);
+                v
+            }
+            _ => vec![],
         }
     }
 }

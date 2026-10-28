@@ -55,18 +55,35 @@ TEXT (`tests/err/`).
 ## The subset
 
 Supported: `int` (i64, overflow is reported), `float`, `bool`, `str`, `list`, `dict`
-(insertion ordered, `IndexMap`), `set`, `tuple`; functions with defaults and keyword
-arguments; `@dataclass` (incl. `frozen=True`) and plain classes with `__init__`,
-methods, `@staticmethod`, `__str__` / `__repr__`; if / while / for (with `else`),
-comprehensions, generator expressions in `sum/min/max/any/all/sorted/list/set/join`,
-`lambda` as `key=`, f-strings with format specs, `raise` (uncaught), `assert`, `del`,
-`math`, most `str` / `list` / `dict` / `set` methods.
+(insertion ordered, `IndexMap`), `set`, `tuple`, `T | None` / `Optional[T]`; functions
+with defaults and keyword arguments; `@dataclass` (incl. `frozen=True`) and plain classes
+with `__init__`, methods, `@staticmethod`, `__str__` / `__repr__`; single inheritance
+with overriding, `super()`, `isinstance`; if / while / for (with `else`), comprehensions,
+generator expressions in `sum/min/max/any/all/sorted/list/set/join`, `lambda` as `key=`,
+f-strings with format specs, `try` / `except` / `else` / `finally`, `raise`, exception
+classes, `assert`, `del`, `math`, most `str` / `list` / `dict` / `set` methods.
+
+How the Python constructs map to Rust:
+
+| Python | Rust |
+|---|---|
+| `x: T \| None`, `if x is not None:` | `Option<T>`, `if let Some(x) = &x` (also `while let`, let-else, let chains) |
+| `node.next = self.head; self.head = node` | `node.next = self.head.take();` |
+| a local that only reads other objects (`cur = cur.next`) | a reference: `let mut cur = &self.head;` |
+| a class with subclasses | an `enum` over the classes that are created; methods dispatch with `match` |
+| `isinstance(s, Circle)` | `if let Shape::Circle(s) = &s` |
+| `super().__init__(...)` | `let (name,) = Shape::init(...)` (the base part of `__init__`) |
+| a `raise` some `try` up the call chain catches | `Result<T, PyErr>` on that path only, `?` |
+| a `raise` nothing catches | `pyrt::raise(..)`: traceback and exit 1, like CPython |
+| `try:` | `'ok: { let e = 'body: { ...; break 'ok; }; match e { .. } }` |
 
 Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
 `eval` / `exec` / `getattr` / `globals`, `global` / `nonlocal`, mutable defaults,
 `list * n` of mutable elements, observable aliasing, modifying a container while
-iterating over it, `x or default` on non-bools. Not yet supported: inheritance, `try`,
-`with`, `match`, `Optional`, generators (`yield`), async, imports beyond `math`,
+iterating over it, `x or default` on non-bools, `is` other than with None, overrides that
+change a method's types, multiple inheritance. Not yet supported: return / break inside
+`try ... finally`, exceptions from comprehensions inside a `try`, exception classes with
+fields, `with`, `match`, generators (`yield`), async, imports beyond `math`,
 `dataclasses`, `typing`.
 
 Known differences: set iteration order is insertion order (CPython's is hash order);
@@ -75,7 +92,8 @@ Known differences: set iteration order is insertion order (CPython's is hash ord
 ## Layout
 
 - `src/front.rs`: ruff parser AST → typed IR (`src/ir.rs`), unification for locals
-- `src/own.rs`: ownership inference, liveness, aliasing and iteration checks
+- `src/own.rs`: ownership inference, liveness, aliasing and iteration checks, views
+- `src/exc.rs`: which exceptions can be caught where, so which functions return `Result`
 - `src/gen.rs`: IR → Rust
 - `pyrt/`: runtime: Python printing (float `repr`, containers), format specs,
   `//` `%` `**` semantics, `str` methods by character index, errors as CPython prints them

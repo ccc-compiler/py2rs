@@ -5,6 +5,7 @@
 //! `gen` prints Rust that uses the `pyrt` runtime crate.
 
 pub mod diag;
+pub mod exc;
 pub mod front;
 pub mod gen;
 pub mod ir;
@@ -17,5 +18,6 @@ pub use diag::Error;
 pub fn translate(src: &str) -> Result<String, Error> {
     let prog = front::lower(src)?;
     let own = own::analyze(&prog)?;
-    gen::generate(&prog, &own)
+    let exc = exc::analyze(&prog)?;
+    gen::generate(&prog, &own, &exc)
 }

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diag::{err, Res};
 use crate::ir::*;
+use crate::exc::{self, Exc};
 use crate::own::{uses, Mode, Own};
 
 const KEYWORDS: &[&str] = &[
@@ -81,8 +82,130 @@ pub fn rty(t: &Ty, p: &Program) -> String {
             }
         }
         Ty::Class(c) => p.classes[*c].name.clone(),
+        Ty::Obj(c) => struct_name(p, *c),
+        Ty::Exc => "PyErr".into(),
+        Ty::Optional(t) => match &**t {
+            Ty::Class(c) if recursive(p, *c) => format!("Option<Box<{}>>", p.classes[*c].name),
+            t => format!("Option<{}>", rty(t, p)),
+        },
         Ty::Var(_) => "_".into(),
     }
+}
+
+/// The struct of a class's own objects (a class with subclasses is an enum).
+pub fn struct_name(p: &Program, c: ClassId) -> String {
+    if p.classes[c].subs.is_empty() {
+        p.classes[c].name.clone()
+    } else {
+        format!("{}Obj", p.classes[c].name)
+    }
+}
+
+/// Classes that are constructed somewhere.
+fn instantiated(p: &Program) -> HashSet<ClassId> {
+    let mut out = HashSet::new();
+    fn ex(e: &Expr, out: &mut HashSet<ClassId>) {
+        if let ExprKind::New(c, _) = e.kind {
+            out.insert(c);
+        }
+        e.children(&mut |c| ex(c, out));
+    }
+    fn st(s: &Stmt, out: &mut HashSet<ClassId>) {
+        stmt_exprs(s, &mut |e| ex(e, out));
+        for b in s.blocks() {
+            b.iter().for_each(|x| st(x, out));
+        }
+    }
+    for f in &p.funcs {
+        f.body.iter().for_each(|s| st(s, &mut out));
+    }
+    out
+}
+
+/// Fields read / written through a value that may be any subclass.
+fn enum_fields(p: &Program) -> (HashSet<(ClassId, String)>, HashSet<(ClassId, String)>) {
+    let mut rd = HashSet::new();
+    let mut wr = HashSet::new();
+    let key = |e: &Expr| -> Option<(ClassId, String)> {
+        if let ExprKind::Field(o, f) = &e.kind {
+            if let Ty::Class(c) = o.ty {
+                if !p.classes[c].subs.is_empty() {
+                    return Some((c, f.clone()));
+                }
+            }
+        }
+        None
+    };
+    fn ex(p: &Program, e: &Expr, key: &dyn Fn(&Expr) -> Option<(ClassId, String)>, rd: &mut HashSet<(ClassId, String)>, wr: &mut HashSet<(ClassId, String)>) {
+        if let Some(k) = key(e) {
+            rd.insert(k);
+        }
+        match &e.kind {
+            ExprKind::Builtin(n, a) if mutating_builtin(n) => {
+                if let Some(k) = key(&a[0]) {
+                    wr.insert(k);
+                }
+            }
+            ExprKind::Method(r, f, _) if !p.funcs[*f].dispatch.is_empty() || true => {
+                if let Some(k) = key(r) {
+                    wr.insert(k);
+                }
+            }
+            _ => {}
+        }
+        e.children(&mut |c| ex(p, c, key, rd, wr));
+    }
+    fn st(p: &Program, s: &Stmt, key: &dyn Fn(&Expr) -> Option<(ClassId, String)>, rd: &mut HashSet<(ClassId, String)>, wr: &mut HashSet<(ClassId, String)>) {
+        match &s.kind {
+            StmtKind::Assign(Target::Place(t), _) | StmtKind::AugAssign(t, _, _) => {
+                if let Some(k) = key(t) {
+                    wr.insert(k);
+                }
+            }
+            _ => {}
+        }
+        stmt_exprs(s, &mut |e| ex(p, e, key, rd, wr));
+        for b in s.blocks() {
+            b.iter().for_each(|x| st(p, x, key, rd, wr));
+        }
+    }
+    for f in &p.funcs {
+        for s in &f.body {
+            st(p, s, &key, &mut rd, &mut wr);
+        }
+    }
+    (rd, wr)
+}
+
+pub fn mutating_builtin(n: &str) -> bool {
+    matches!(
+        n,
+        "list.append" | "list.extend" | "list.insert" | "list.pop" | "list.pop_at" | "list.remove" | "list.sort"
+            | "list.reverse" | "list.clear" | "list.swap" | "dict.pop" | "dict.pop_default" | "dict.setdefault"
+            | "dict.clear" | "dict.update" | "set.add" | "set.remove" | "set.discard" | "set.clear"
+    )
+}
+
+/// A class that contains itself (through Optional fields) needs a Box.
+pub fn recursive(p: &Program, c: ClassId) -> bool {
+    fn reach(p: &Program, t: &Ty, target: ClassId, seen: &mut HashSet<ClassId>) -> bool {
+        match t {
+            Ty::Class(d) => {
+                if *d == target {
+                    return true;
+                }
+                if !seen.insert(*d) {
+                    return false;
+                }
+                p.classes[*d].fields.iter().any(|f| reach(p, &f.ty, target, seen))
+            }
+            Ty::Optional(x) => reach(p, x, target, seen),
+            Ty::Tuple(ts) => ts.iter().any(|x| reach(p, x, target, seen)),
+            _ => false,
+        }
+    }
+    let mut seen = HashSet::new();
+    p.classes[c].fields.iter().any(|f| reach(p, &f.ty, c, &mut seen))
 }
 
 /// Ordered by `Ord` (no floats inside)?
@@ -113,6 +236,8 @@ struct R {
     code: String,
     kind: Kind,
     prec: u8,
+    /// a reference to a `Box<T>` (the value of an `Option<Box<T>>`)
+    boxed: bool,
 }
 
 const ATOM: u8 = 100;
@@ -131,7 +256,7 @@ const RANGE: u8 = 10;
 const LOW: u8 = 5;
 
 fn r(code: impl Into<String>, kind: Kind, prec: u8) -> R {
-    R { code: code.into(), kind, prec }
+    R { code: code.into(), kind, prec, boxed: false }
 }
 
 /// A number as the receiver of a method call (`5_i64.pow(2)`).
@@ -169,21 +294,22 @@ enum Item {
     Zip(Vec<Item>),
 }
 
-pub fn generate(p: &Program, o: &Own) -> Res<String> {
+thread_local! {
+    /// some call site uses `.or_raise()`
+    static OR_RAISE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// some code uses PyErr
+    static PYERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// user exception classes raised as PyErr
+    static EXC_USED: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+}
+
+pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
+    OR_RAISE.with(|c| c.set(false));
+    PYERR.with(|c| c.set(false));
+    EXC_USED.with(|c| c.borrow_mut().clear());
     let mut out = String::new();
-    let uses_map = p_uses_collections(p);
-    if uses_map.0 || uses_map.1 {
-        let mut v = vec![];
-        if uses_map.0 {
-            v.push("IndexMap");
-        }
-        if uses_map.1 {
-            v.push("IndexSet");
-        }
-        out += &format!("use pyrt::{{{}}};\n\n", v.join(", "));
-    }
     for c in &p.consts {
-        let mut g = FGen::new(p, o, p.main);
+        let mut g = FGen::new(p, o, x, p.main);
         let v = g.ex(&c.value)?;
         let (t, code) = match c.value.ty {
             Ty::Str => ("&str".to_string(), v.code),
@@ -197,20 +323,66 @@ pub fn generate(p: &Program, o: &Own) -> Res<String> {
     if !p.consts.is_empty() {
         out += "\n";
     }
+    let inst = instantiated(p);
+    let fields = enum_fields(p);
     for (ci, c) in p.classes.iter().enumerate() {
-        out += &gen_class(p, o, ci, c)?;
+        if c.exc.is_some() {
+            continue;
+        }
+        out += &gen_class(p, o, x, ci, c, &inst, &fields)?;
     }
     for (fid, f) in p.funcs.iter().enumerate() {
         if f.class.is_some() || fid == p.main {
             continue;
         }
-        let mut g = FGen::new(p, o, fid);
+        let mut g = FGen::new(p, o, x, fid);
         out += &g.func("")?;
         out += "\n";
     }
-    let mut g = FGen::new(p, o, p.main);
+    let mut g = FGen::new(p, o, x, p.main);
     out += &g.func("")?;
-    Ok(out)
+    let uses_map = p_uses_collections(p);
+    let mut v = vec![];
+    if uses_map.0 {
+        v.push("IndexMap");
+    }
+    if uses_map.1 {
+        v.push("IndexSet");
+    }
+    if OR_RAISE.with(|c| c.get()) {
+        v.push("OrRaise");
+    }
+    if PYERR.with(|c| c.get()) {
+        v.push("PyErr");
+    }
+    let mut head = match v.len() {
+        0 => String::new(),
+        1 => format!("use pyrt::{};\n\n", v[0]),
+        _ => format!("use pyrt::{{{}}};\n\n", v.join(", ")),
+    };
+    // exception classes raised as values: their name and bases, most specific first
+    let used = EXC_USED.with(|c| c.borrow().clone());
+    let mut any = false;
+    for c in &p.classes {
+        if c.exc.is_some() && used.contains(&c.name) {
+            let ch: Vec<String> = exc::chain(p, &c.name).iter().map(|k| format!("{:?}", k)).collect();
+            head += &format!("const {}: &[&str] = &[{}];\n", exc_const(&c.name), ch.join(", "));
+            any = true;
+        }
+    }
+    if any {
+        head += "\n";
+    }
+    Ok(head + &out)
+}
+
+/// The constant naming an exception class and its bases.
+fn exc_const(name: &str) -> String {
+    if crate::front::EXCEPTIONS.contains(&name) {
+        format!("pyrt::{}", snake(name).to_uppercase())
+    } else {
+        snake(name).to_uppercase()
+    }
 }
 
 fn p_uses_collections(p: &Program) -> (bool, bool) {
@@ -254,10 +426,7 @@ fn p_uses_collections(p: &Program) -> (bool, bool) {
 }
 
 fn sub_blocks(s: &Stmt) -> Vec<&Vec<Stmt>> {
-    match &s.kind {
-        StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => vec![a, b],
-        _ => vec![],
-    }
+    s.blocks()
 }
 
 fn stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
@@ -275,7 +444,7 @@ fn stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
             f(e)
         }
         StmtKind::AugVar(_, _, e) => f(e),
-        StmtKind::If(c, ..) | StmtKind::While(c, ..) => f(c),
+        StmtKind::If(c, ..) | StmtKind::While(c, ..) | StmtKind::LetSome(_, c, _) => f(c),
         StmtKind::For(_, it, ..) => it.exprs(f),
         StmtKind::Return(Some(e)) | StmtKind::Raise(_, Some(e)) => f(e),
         StmtKind::Assert(c, m) => {
@@ -288,24 +457,41 @@ fn stmt_exprs(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
-fn gen_class(p: &Program, o: &Own, ci: ClassId, c: &Class) -> Res<String> {
+fn gen_class(
+    p: &Program,
+    o: &Own,
+    x: &Exc,
+    ci: ClassId,
+    c: &Class,
+    inst: &HashSet<ClassId>,
+    fields: &(HashSet<(ClassId, String)>, HashSet<(ClassId, String)>),
+) -> Res<String> {
     let mut out = String::new();
+    let in_tree = c.base.is_some() || !c.subs.is_empty();
+    if !c.subs.is_empty() {
+        out += &gen_enum(p, o, x, ci, c, inst, fields)?;
+    }
+    // classes of a hierarchy that are never constructed need no struct
+    if in_tree && !inst.contains(&ci) {
+        return Ok(out);
+    }
+    let sname = struct_name(p, ci);
     let derives = if c.dataclass { "Clone, Debug, PartialEq" } else { "Clone, Debug" };
-    out += &format!("#[derive({})]\npub struct {} {{\n", derives, c.name);
+    out += &format!("#[derive({})]\npub struct {} {{\n", derives, sname);
     for f in &c.fields {
         out += &format!("    pub {}: {},\n", ident(&f.name), rty(&f.ty, p));
     }
     out += "}\n\n";
     let methods: Vec<FuncId> = c.methods.iter().map(|(_, f)| *f).collect();
     if !methods.is_empty() {
-        out += &format!("impl {} {{\n", c.name);
+        out += &format!("impl {} {{\n", sname);
         let mut first = true;
         for fid in &methods {
             if !first {
                 out += "\n";
             }
             first = false;
-            let mut g = FGen::new(p, o, *fid);
+            let mut g = FGen::new(p, o, x, *fid);
             let code = g.func("    ")?;
             out += &code;
         }
@@ -314,7 +500,7 @@ fn gen_class(p: &Program, o: &Own, ci: ClassId, c: &Class) -> Res<String> {
     let has_str = c.method("__str__").is_some();
     let has_repr = c.method("__repr__").is_some();
     if c.dataclass || has_str || has_repr {
-        out += &format!("impl pyrt::Py for {} {{\n", c.name);
+        out += &format!("impl pyrt::Py for {} {{\n", sname);
         out += "    fn fmt_repr(&self, out: &mut String) {\n";
         if has_repr {
             out += "        out.push_str(&self.__repr__());\n";
@@ -335,8 +521,151 @@ fn gen_class(p: &Program, o: &Own, ci: ClassId, c: &Class) -> Res<String> {
         }
         out += "}\n\n";
     }
-    let _ = ci;
     Ok(out)
+}
+
+/// A class with subclasses: an enum over the classes that are constructed.
+fn gen_enum(
+    p: &Program,
+    o: &Own,
+    x: &Exc,
+    ci: ClassId,
+    c: &Class,
+    inst: &HashSet<ClassId>,
+    fields: &(HashSet<(ClassId, String)>, HashSet<(ClassId, String)>),
+) -> Res<String> {
+    let vars: Vec<ClassId> = p.subtree(ci).into_iter().filter(|x| inst.contains(x)).collect();
+    let all_dc = vars.iter().all(|x| p.classes[*x].dataclass);
+    let mut out = format!("#[derive(Clone, Debug{})]\npub enum {} {{\n", if all_dc { ", PartialEq" } else { "" }, c.name);
+    for x in &vars {
+        out += &format!("    {}({}),\n", p.classes[*x].name, struct_name(p, *x));
+    }
+    out += "}\n\n";
+    let arms = |body: &dyn Fn(&str) -> String| -> String {
+        if vars.is_empty() {
+            return "match *self {}".into();
+        }
+        let mut s = "match self {\n".to_string();
+        for x in &vars {
+            s += &format!("            {}::{}(x) => {},\n", c.name, p.classes[*x].name, body("x"));
+        }
+        s + "        }"
+    };
+    let mut items: Vec<String> = vec![];
+    // field accessors
+    for f in &c.fields {
+        let key = (ci, f.name.clone());
+        let n = ident(&f.name);
+        if fields.0.contains(&key) {
+            let (t, b) = if f.ty.is_copy() {
+                (rty(&f.ty, p), format!("x.{}", n))
+            } else {
+                (format!("&{}", rty(&f.ty, p)), format!("&x.{}", n))
+            };
+            items.push(format!("    pub fn {}(&self) -> {} {{\n        {}\n    }}\n", f.name, t, arms(&|_| b.clone())));
+        }
+        if fields.1.contains(&key) {
+            let b = format!("&mut x.{}", n);
+            items.push(format!("    pub fn {}_mut(&mut self) -> &mut {} {{\n        {}\n    }}\n", f.name, rty(&f.ty, p), arms(&|_| b.clone())));
+        }
+    }
+    // `isinstance(x, D)` for a D with subclasses: a copy as a D
+    for d in narrowed_to(p) {
+        if d == ci || !p.is_sub(d, ci) {
+            continue;
+        }
+        let dv: Vec<ClassId> = p.subtree(d).into_iter().filter(|x| inst.contains(x)).collect();
+        let mut m = String::new();
+        for x in &dv {
+            let xn = &p.classes[*x].name;
+            m += &format!("            {}::{}(x) => Some({}::{}(x.clone())),\n", c.name, xn, p.classes[d].name, xn);
+        }
+        if dv.len() < vars.len() {
+            m += "            _ => None,\n";
+        }
+        items.push(format!(
+            "    pub fn as_{}(&self) -> Option<{}> {{\n        match self {{\n{}        }}\n    }}\n",
+            snake(&p.classes[d].name), p.classes[d].name, m));
+    }
+    // dispatchers
+    for (_, fid) in &c.dispatch {
+        let mut g = FGen::new(p, o, x, *fid);
+        items.push(g.func("    ")?);
+    }
+    // the base part of __init__, for super().__init__()
+    if let Some(init) = c.init {
+        if uses_super_init(p, init) {
+            let mut g = FGen::new(p, o, x, init);
+            g.init_tuple = true;
+            items.push(g.func("    ")?);
+        }
+    }
+    if !items.is_empty() {
+        out += &format!("impl {} {{\n{}}}\n\n", c.name, items.join("\n"));
+    }
+    let printable = vars.iter().all(|x| {
+        let k = &p.classes[*x];
+        k.dataclass || k.method("__str__").is_some() || k.method("__repr__").is_some()
+    });
+    if printable {
+        out += &format!(
+            "impl pyrt::Py for {} {{\n    fn fmt_repr(&self, out: &mut String) {{\n        {}\n    }}\n    fn fmt_str(&self, out: &mut String) {{\n        {}\n    }}\n}}\n\n",
+            c.name,
+            arms(&|x| format!("{}.fmt_repr(out)", x)),
+            arms(&|x| format!("{}.fmt_str(out)", x))
+        );
+    }
+    // a subclass enum converts into this one
+    for b in p.subtree(ci).into_iter().skip(1) {
+        if p.classes[b].subs.is_empty() {
+            continue;
+        }
+        let bv: Vec<ClassId> = p.subtree(b).into_iter().filter(|x| inst.contains(x)).collect();
+        let mut m = String::new();
+        for x in &bv {
+            m += &format!("            {0}::{1}(x) => {2}::{1}(x),\n", p.classes[b].name, p.classes[*x].name, c.name);
+        }
+        let body = if bv.is_empty() { "match b {}".to_string() } else { format!("match b {{\n{}        }}", m) };
+        out += &format!("impl From<{}> for {} {{\n    fn from(b: {}) -> Self {{\n        {}\n    }}\n}}\n\n", p.classes[b].name, c.name, p.classes[b].name, body);
+    }
+    Ok(out)
+}
+
+/// Classes with subclasses that some `isinstance` narrows to.
+fn narrowed_to(p: &Program) -> Vec<ClassId> {
+    let mut out = vec![];
+    fn ex(p: &Program, e: &Expr, out: &mut Vec<ClassId>) {
+        if let ExprKind::IsInst(_, d, Some(_)) = e.kind {
+            if !p.classes[d].subs.is_empty() && !out.contains(&d) {
+                out.push(d);
+            }
+        }
+        e.children(&mut |c| ex(p, c, out));
+    }
+    fn st(p: &Program, s: &Stmt, out: &mut Vec<ClassId>) {
+        stmt_exprs(s, &mut |e| ex(p, e, out));
+        for b in s.blocks() {
+            b.iter().for_each(|x| st(p, x, out));
+        }
+    }
+    for f in &p.funcs {
+        f.body.iter().for_each(|s| st(p, s, &mut out));
+    }
+    out
+}
+
+/// Some subclass calls `super().__init__()` reaching `init`.
+fn uses_super_init(p: &Program, init: FuncId) -> bool {
+    fn ex(e: &Expr, init: FuncId) -> bool {
+        let mut found = matches!(e.kind, ExprKind::SuperInit(f, _) if f == init);
+        e.children(&mut |c| found |= ex(c, init));
+        found
+    }
+    p.funcs.iter().any(|f| f.is_init && f.body.iter().any(|s| {
+        let mut found = false;
+        stmt_exprs(s, &mut |e| found |= ex(e, init));
+        found
+    }))
 }
 
 /// Where a local variable is declared.
@@ -351,6 +680,11 @@ enum Decl {
 struct FGen<'a> {
     p: &'a Program,
     o: &'a Own,
+    x: &'a Exc,
+    /// exceptions that must be handled here: (catchers, label of the try block;
+    /// None = return Err from the function)
+    ctx: Vec<(HashSet<String>, Option<String>)>,
+    tries: u32,
     fid: FuncId,
     f: &'a Func,
     kinds: HashMap<VarId, Kind>,
@@ -361,20 +695,39 @@ struct FGen<'a> {
     labels: u32,
     /// label of each enclosing loop that has an `else`
     loop_labels: Vec<Option<String>>,
+    /// enclosing loops: (label, label used, labeled blocks between here and the loop)
+    loops: Vec<(String, bool, u32)>,
+    loopn: u32,
     /// fields of `self` held in locals inside __init__
     init_fields: HashMap<String, String>,
     tmp: u32,
     /// statements to emit before the current one
     pre: Vec<String>,
+    /// narrowed variables holding `&Box<T>`
+    boxed: HashSet<VarId>,
+    /// variables assigned in the region a narrowing covers
+    region: HashSet<VarId>,
+    renames: HashMap<VarId, String>,
+    /// `self.f = f` in __init__: the parameter is the field value
+    skip: HashSet<u32>,
+    /// generate the base part of __init__ (`fn init(..) -> (fields)`)
+    init_tuple: bool,
+    /// fields declared by super().__init__() that are assigned again
+    init_mut: HashSet<String>,
+    /// fields from super().__init__() overwritten before being read
+    init_dead: HashSet<String>,
     /// variables read anywhere in the function
     used: HashSet<VarId>,
 }
 
 impl<'a> FGen<'a> {
-    fn new(p: &'a Program, o: &'a Own, fid: FuncId) -> Self {
+    fn new(p: &'a Program, o: &'a Own, x: &'a Exc, fid: FuncId) -> Self {
         FGen {
             p,
             o,
+            x,
+            ctx: vec![(x.need[fid].clone(), None)],
+            tries: 0,
             fid,
             f: &p.funcs[fid],
             kinds: HashMap::new(),
@@ -384,9 +737,18 @@ impl<'a> FGen<'a> {
             nonneg: HashSet::new(),
             labels: 0,
             loop_labels: vec![],
+            loops: vec![],
+            loopn: 0,
             init_fields: HashMap::new(),
             tmp: 0,
             pre: vec![],
+            boxed: HashSet::new(),
+            region: HashSet::new(),
+            renames: HashMap::new(),
+            skip: HashSet::new(),
+            init_tuple: false,
+            init_mut: HashSet::new(),
+            init_dead: HashSet::new(),
             used: {
                 let mut u = vec![];
                 fn st(s: &Stmt, u: &mut Vec<VarId>) {
@@ -405,6 +767,9 @@ impl<'a> FGen<'a> {
     }
 
     fn name(&self, v: VarId) -> String {
+        if let Some(n) = self.renames.get(&v) {
+            return n.clone();
+        }
         let var = &self.f.vars[v];
         if var.kind == VarKind::SelfParam {
             return "self".into();
@@ -428,11 +793,14 @@ impl<'a> FGen<'a> {
             "main".to_string()
         } else if f.name == "main" && f.class.is_none() {
             "py_main".to_string()
+        } else if f.is_init && self.init_tuple {
+            "init".to_string()
         } else if f.is_init {
             "new".to_string()
         } else {
             ident(&f.name)
         };
+        let fields_of = |g: &Self| -> Vec<Field> { g.p.classes[f.class.unwrap()].fields.clone() };
         let mut params = vec![];
         if let Some(sv) = f.self_var {
             if !f.is_init {
@@ -463,23 +831,43 @@ impl<'a> FGen<'a> {
                 ),
                 Mode::Mut => (format!("&mut {}", self.ty(&v.ty)), Kind::Mut),
             };
-            let m = if mutable && matches!(mode, Mode::Copy | Mode::Owned) { "mut " } else { "" };
+            // a dispatcher lends an owned argument mutably to some implementation
+            let lends = mode == Mode::Owned && f.dispatch.iter().any(|(_, x)| self.o.params[*x][i] == Mode::Mut);
+            let m = if (mutable || lends) && matches!(mode, Mode::Copy | Mode::Owned) { "mut " } else { "" };
             params.push(format!("{}{}: {}", m, self.name(q.var), t));
             self.kinds.insert(q.var, k);
             self.declared.insert(q.var);
         }
-        let ret = if f.is_init {
+        let ret = if f.is_init && self.init_tuple {
+            let ts: Vec<String> = fields_of(self).iter().map(|fd| self.ty(&fd.ty)).collect();
+            if ts.len() == 1 { format!(" -> ({},)", ts[0]) } else { format!(" -> ({})", ts.join(", ")) }
+        } else if f.is_init {
             " -> Self".to_string()
         } else if f.ret == Ty::None {
             String::new()
         } else {
             format!(" -> {}", self.ty(&f.ret))
         };
+        let ret = if self.x.fallible[self.fid] {
+            PYERR.with(|c| c.set(true));
+            match ret.strip_prefix(" -> ") {
+                Some(t) => format!(" -> Result<{}, PyErr>", t),
+                None => " -> Result<(), PyErr>".to_string(),
+            }
+        } else {
+            ret
+        };
+        let ok = |v: String, g: &Self| if g.x.fallible[g.fid] { format!("Ok({})", v) } else { v };
         let vis = if f.class.is_some() { "pub " } else { "" };
         let mut out = format!("{}{}fn {}({}){} {{\n", ind, vis, name, params.join(", "), ret);
         let inner = format!("{}    ", ind);
         if is_main {
             out += &format!("{}pyrt::init();\n", inner);
+        }
+        if !f.dispatch.is_empty() {
+            out += &self.dispatch_body(&inner);
+            out += &format!("{}}}\n", ind);
+            return Ok(out);
         }
         if f.is_init {
             self.init_prologue(&inner, &mut out)?;
@@ -492,7 +880,11 @@ impl<'a> FGen<'a> {
                 if let StmtKind::Return(Some(e)) = &s.kind {
                     self.pre_decls(s.id, &inner, &mut out);
                     let v = self.owned(e)?;
-                    out += &format!("{}{}\n", inner, v);
+                    let pre = std::mem::take(&mut self.pre);
+                    for p in pre {
+                        out += &format!("{}{}\n", inner, p);
+                    }
+                    out += &format!("{}{}\n", inner, ok(v, self));
                     continue;
                 }
             }
@@ -512,7 +904,17 @@ impl<'a> FGen<'a> {
                     }
                 })
                 .collect();
-            out += &format!("{}Self {{ {} }}\n", inner, fs.join(", "));
+            if self.init_tuple {
+                let ls: Vec<String> = fields_of(self).iter().map(|fd| self.init_fields[&fd.name].clone()).collect();
+                let t = if ls.len() == 1 { format!("({},)", ls[0]) } else { format!("({})", ls.join(", ")) };
+                out += &format!("{}{}\n", inner, ok(t, self));
+            } else {
+                out += &format!("{}{}\n", inner, ok(format!("Self {{ {} }}", fs.join(", ")), self));
+            }
+        } else if matches!(f.ret, Ty::Optional(_)) && !always_exits(body) {
+            out += &format!("{}{}\n", inner, ok("None".into(), self));
+        } else if f.ret == Ty::None && self.x.fallible[self.fid] && !always_exits(body) {
+            out += &format!("{}Ok(())\n", inner);
         } else if f.ret != Ty::None && !always_exits(body) {
             return err(f.line, format!("{}() can reach its end without returning a value", f.name))
                 .map_err(|e| e.hint("add a return (Python would return None)"));
@@ -521,11 +923,63 @@ impl<'a> FGen<'a> {
         Ok(out)
     }
 
+    /// `match self { C::X(x) => x.m(args), .. }`
+    fn dispatch_body(&mut self, ind: &str) -> String {
+        let f = self.f;
+        let c = f.class.unwrap();
+        let cname = &self.p.classes[c].name;
+        let inst = instantiated(self.p);
+        let arms: Vec<String> = f
+            .dispatch
+            .iter()
+            .filter(|(x, _)| inst.contains(x))
+            .map(|(x, imp)| {
+                let args: Vec<String> = f
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| {
+                        let n = self.name(q.var);
+                        match (self.o.params[self.fid][i], self.o.params[*imp][i]) {
+                            (Mode::Owned, Mode::Ref) => format!("&{}", n),
+                            (Mode::Owned, Mode::Mut) => format!("&mut {}", n),
+                            _ => n,
+                        }
+                    })
+                    .collect();
+                let call = format!("x.{}({})", ident(&self.p.funcs[*imp].name), args.join(", "));
+                let call = if self.x.fallible[self.fid] && !self.x.fallible[*imp] { format!("Ok({})", call) } else { call };
+                format!("{}    {}::{}(x) => {},\n", ind, cname, self.p.classes[*x].name, call)
+            })
+            .collect();
+        if arms.is_empty() {
+            return format!("{}match *self {{}}\n", ind);
+        }
+        format!("{}match self {{\n{}{}}}\n", ind, arms.concat(), ind)
+    }
+
     /// In `__init__`, every field is a local until `Self { .. }` is built.
     fn init_prologue(&mut self, ind: &str, out: &mut String) -> Res<()> {
         let c = &self.p.classes[self.f.class.unwrap()];
         let names: HashSet<&str> = self.f.vars.iter().map(|v| v.name.as_str()).collect();
+        let sv0 = self.f.self_var.unwrap();
+        let mutated0 = self.field_mutated_in_init();
+        for st in &self.f.body {
+            if let StmtKind::Assign(Target::Place(Expr { kind: ExprKind::Field(o, f), .. }), Expr { kind: ExprKind::Var(p), .. }) = &st.kind {
+                let pv = &self.f.vars[*p];
+                let assigned = assigned_vars(&self.f.body).contains(p);
+                let once = self.f.body.iter().filter(|x| matches!(&x.kind, StmtKind::Assign(Target::Place(Expr { kind: ExprKind::Field(o2, f2), .. }), _) if f2 == f && matches!(o2.kind, ExprKind::Var(w) if w == sv0))).count() == 1;
+                if matches!(o.kind, ExprKind::Var(w) if w == sv0) && pv.kind == VarKind::Param && pv.name == *f && !assigned && once && !mutated0.contains(f) {
+                    self.skip.insert(st.id);
+                    self.init_fields.insert(f.clone(), ident(f));
+                    self.init_fields_declared(f);
+                }
+            }
+        }
         for fd in &c.fields {
+            if self.init_fields.contains_key(&fd.name) {
+                continue;
+            }
             let local = if names.contains(fd.name.as_str()) {
                 format!("self_{}", fd.name)
             } else {
@@ -535,8 +989,17 @@ impl<'a> FGen<'a> {
         }
         // fields assigned more than once, in nested blocks or with a class default
         let mut counts: HashMap<String, (u32, bool)> = HashMap::new();
-        fn walk(s: &[Stmt], depth: u32, sv: VarId, c: &mut HashMap<String, (u32, bool)>) {
+        fn walk(p: &Program, s: &[Stmt], depth: u32, sv: VarId, c: &mut HashMap<String, (u32, bool)>) {
             for st in s {
+                if let StmtKind::Expr(Expr { kind: ExprKind::SuperInit(fid, _), .. }) = &st.kind {
+                    for fd in &p.classes[p.funcs[*fid].class.unwrap()].fields {
+                        let e = c.entry(fd.name.clone()).or_insert((0, false));
+                        e.0 += 1;
+                        if depth > 0 {
+                            e.1 = true;
+                        }
+                    }
+                }
                 if let StmtKind::Assign(Target::Place(Expr { kind: ExprKind::Field(o, f), .. }), _)
                 | StmtKind::AugAssign(Expr { kind: ExprKind::Field(o, f), .. }, _, _) = &st.kind
                 {
@@ -549,13 +1012,22 @@ impl<'a> FGen<'a> {
                     }
                 }
                 for b in sub_blocks(st) {
-                    walk(b, depth + 1, sv, c);
+                    walk(p, b, depth + 1, sv, c);
                 }
             }
         }
         let sv = self.f.self_var.unwrap();
-        walk(&self.f.body, 0, sv, &mut counts);
+        walk(self.p, &self.f.body, 0, sv, &mut counts);
         let mutated = self.field_mutated_in_init();
+        // fields set by a top-level super().__init__() are declared there
+        let mut by_super: HashSet<String> = HashSet::new();
+        for st in &self.f.body {
+            if let StmtKind::Expr(Expr { kind: ExprKind::SuperInit(fid, _), .. }) = &st.kind {
+                for fd in &self.p.classes[self.p.funcs[*fid].class.unwrap()].fields {
+                    by_super.insert(fd.name.clone());
+                }
+            }
+        }
         for fd in &c.fields {
             let local = self.init_fields[&fd.name].clone();
             let (n, nested) = counts.get(&fd.name).copied().unwrap_or((0, false));
@@ -569,6 +1041,17 @@ impl<'a> FGen<'a> {
                         return err(self.f.line, format!("__init__ does not set field `{}`", fd.name));
                     }
                 }
+            } else if by_super.contains(&fd.name) && !nested {
+                if self.overwritten_after_super(&fd.name) {
+                    // super().__init__()'s value is replaced before it is read
+                    self.init_dead.insert(fd.name.clone());
+                    if n > 2 || mutated.contains(&fd.name) {
+                        out.push_str(&format!("{}let mut {}: {};\n", ind, local, self.ty(&fd.ty)));
+                        self.init_fields_declared(&fd.name);
+                    }
+                } else if n > 1 || mutated.contains(&fd.name) {
+                    self.init_mut.insert(fd.name.clone());
+                }
             } else if n > 1 || nested || mutated.contains(&fd.name) {
                 let m = if n > 1 || nested || mutated.contains(&fd.name) { "mut " } else { "" };
                 out.push_str(&format!("{}let {}{}: {};\n", ind, m, local, self.ty(&fd.ty)));
@@ -576,6 +1059,33 @@ impl<'a> FGen<'a> {
             }
         }
         Ok(())
+    }
+
+    /// After the top-level super().__init__(), is field `f` assigned before it is read?
+    fn overwritten_after_super(&self, f: &str) -> bool {
+        let sv = self.f.self_var.unwrap();
+        let body = &self.f.body;
+        let Some(i) = body.iter().position(|s| matches!(&s.kind, StmtKind::Expr(Expr { kind: ExprKind::SuperInit(..), .. }))) else {
+            return false;
+        };
+        fn mentions(e: &Expr, sv: VarId, f: &str) -> bool {
+            let mut m = matches!(&e.kind, ExprKind::Field(o, g) if g == f && matches!(o.kind, ExprKind::Var(v) if v == sv));
+            e.children(&mut |c| m |= mentions(c, sv, f));
+            m
+        }
+        for s in &body[i + 1..] {
+            if let StmtKind::Assign(Target::Place(Expr { kind: ExprKind::Field(o, g), .. }), v) = &s.kind {
+                if g == f && matches!(o.kind, ExprKind::Var(w) if w == sv) {
+                    return !mentions(v, sv, f);
+                }
+            }
+            let mut m = false;
+            stmt_exprs(s, &mut |e| m |= mentions(e, sv, f));
+            if m || !s.blocks().is_empty() {
+                return false;
+            }
+        }
+        false
     }
 
     fn init_fields_declared(&mut self, f: &str) {
@@ -788,8 +1298,10 @@ impl<'a> FGen<'a> {
         for v in vs {
             if self.declared.insert(v) {
                 let m = if self.muts.contains(&v) { "mut " } else { "" };
-                out.push_str(&format!("{}let {}{}: {};\n", ind, m, self.name(v), self.ty(&self.f.vars[v].ty)));
-                self.kinds.insert(v, Kind::Place);
+                let view = self.o.views[self.fid].contains(&v);
+                let amp = if view { "&" } else { "" };
+                out.push_str(&format!("{}let {}{}: {}{};\n", ind, m, self.name(v), amp, self.ty(&self.f.vars[v].ty)));
+                self.kinds.insert(v, if view { Kind::Ref } else { Kind::Place });
             }
         }
     }
@@ -797,7 +1309,10 @@ impl<'a> FGen<'a> {
     // ------------------------------------------------------------ statements
 
     fn block(&mut self, s: &[Stmt], ind: &str, out: &mut String) -> Res<()> {
-        for st in s {
+        for (i, st) in s.iter().enumerate() {
+            if matches!(st.kind, StmtKind::LetSome(..)) {
+                self.region = assigned_vars(&s[i + 1..]);
+            }
             self.stmt(st, ind, out)?;
         }
         Ok(())
@@ -813,9 +1328,39 @@ impl<'a> FGen<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, ind: &str, out: &mut String) -> Res<()> {
+        if self.skip.contains(&s.id) {
+            return Ok(());
+        }
         self.pre_decls(s.id, ind, out);
         let inner = format!("{}    ", ind);
         match &s.kind {
+            StmtKind::Expr(e @ Expr { kind: ExprKind::SuperInit(fid, _), .. }) => {
+                let call = self.ex(e)?;
+                let b = self.p.funcs[*fid].class.unwrap();
+                let names: Vec<String> = self.p.classes[b].fields.iter().map(|fd| fd.name.clone()).collect();
+                let all_new = names.iter().all(|n| !self.init_fields.contains_key(&format!("#declared:{}", n)));
+                let locals: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        if self.init_dead.contains(n) {
+                            return "_".to_string();
+                        }
+                        let l = self.init_fields[n].clone();
+                        if all_new && self.init_mut.contains(n) { format!("mut {}", l) } else { l }
+                    })
+                    .collect();
+                let pat = if locals.len() == 1 { format!("({},)", locals[0]) } else { format!("({})", locals.join(", ")) };
+                if all_new {
+                    out.push_str(&format!("{}let {} = {};\n", ind, pat, call.code));
+                    for n in &names {
+                        if !self.init_dead.contains(n) {
+                            self.init_fields_declared(n);
+                        }
+                    }
+                } else {
+                    out.push_str(&format!("{}{} = {};\n", ind, pat, call.code));
+                }
+            }
             StmtKind::Expr(e) => {
                 let v = self.ex(e)?;
                 for p in std::mem::take(&mut self.pre) {
@@ -826,24 +1371,44 @@ impl<'a> FGen<'a> {
             StmtKind::Pass => {}
             StmtKind::Break => match self.loop_labels.last() {
                 Some(Some(l)) => out.push_str(&format!("{}break {};\n", ind, l)),
-                _ => out.push_str(&format!("{}break;\n", ind)),
+                _ => {
+                    let l = self.loop_label();
+                    out.push_str(&format!("{}break{};\n", ind, l));
+                }
             },
-            StmtKind::Continue => out.push_str(&format!("{}continue;\n", ind)),
+            StmtKind::Continue => {
+                let l = self.loop_label();
+                out.push_str(&format!("{}continue{};\n", ind, l));
+            }
+            StmtKind::Return(None) if self.x.fallible[self.fid] => out.push_str(&format!("{}return Ok(());\n", ind)),
             StmtKind::Return(None) => out.push_str(&format!("{}return;\n", ind)),
             StmtKind::Return(Some(e)) => {
                 let v = self.owned(e)?;
-                out.push_str(&format!("{}return {};\n", ind, v));
+                for p in std::mem::take(&mut self.pre) {
+                    out.push_str(&format!("{}{}\n", ind, p));
+                }
+                if self.x.fallible[self.fid] {
+                    out.push_str(&format!("{}return Ok({});\n", ind, v));
+                } else {
+                    out.push_str(&format!("{}return {};\n", ind, v));
+                }
             }
+            StmtKind::Reraise(v) => {
+                let n = self.name(*v);
+                out.push_str(&format!("{}{};\n", ind, self.propagate(&n)));
+            }
+            StmtKind::Try(body, hs, orelse, fin) => self.try_stmt(body, hs, orelse, fin, ind, out)?,
             StmtKind::Assign(t, v) => self.assign(s, t, v, ind, out)?,
             StmtKind::AugAssign(t, op, v) => self.aug_assign(t, *op, v, ind, out)?,
             StmtKind::AugVar(v, op, e) => {
                 let name = self.name(*v);
                 let t = self.f.vars[*v].ty.clone();
-                let target = R { code: name.clone(), kind: Kind::Place, prec: ATOM };
+                let target = r(name.clone(), Kind::Place, ATOM);
                 let line = self.aug_code(&target, &t, *op, e)?;
                 out.push_str(&format!("{}{}\n", ind, line));
             }
             StmtKind::If(c, a, b) => {
+                self.region = assigned_vars(a);
                 let cv = self.cond(c)?;
                 out.push_str(&format!("{}if {} {{\n", ind, cv));
                 self.block(a, &inner, out)?;
@@ -880,16 +1445,20 @@ impl<'a> FGen<'a> {
                     }
                     None => (ind.to_string(), inner.clone()),
                 };
-                if forever {
-                    out.push_str(&format!("{}loop {{\n", ind2));
+                let head = if forever {
+                    "loop {\n".to_string()
                 } else {
+                    self.region = assigned_vars(body);
                     let cv = self.cond(c)?;
-                    out.push_str(&format!("{}while {} {{\n", ind2, cv));
-                }
+                    format!("while {} {{\n", cv)
+                };
                 let mut b = String::new();
                 self.loop_labels.push(label.clone());
+                self.loop_enter();
                 self.block(body, &inner2, &mut b)?;
+                let ll = self.loop_exit();
                 self.loop_labels.pop();
+                out.push_str(&format!("{}{}{}", ind2, ll, head));
                 out.push_str(&b);
                 out.push_str(&format!("{}}}\n", ind2));
                 self.block(orelse, &ind2, out)?;
@@ -910,12 +1479,14 @@ impl<'a> FGen<'a> {
                 let (code, item) = self.iter_code(it, by_mut, true)?;
                 self.mark_nonneg(t, it);
                 let pat = self.pat(t, &item)?;
-                out.push_str(&format!("{}for {} in {} {{\n", ind2, pat, code));
                 let mut b = String::new();
                 self.rebind_loop_vars(t, &inner2, &mut b);
                 self.loop_labels.push(label.clone());
+                self.loop_enter();
                 self.block(body, &inner2, &mut b)?;
+                let ll = self.loop_exit();
                 self.loop_labels.pop();
+                out.push_str(&format!("{}{}for {} in {} {{\n", ind2, ll, pat, code));
                 out.push_str(&b);
                 out.push_str(&format!("{}}}\n", ind2));
                 self.block(orelse, &ind2, out)?;
@@ -924,11 +1495,13 @@ impl<'a> FGen<'a> {
                 }
             }
             StmtKind::Raise(name, msg) => {
-                let m = match msg {
-                    Some(m) => self.borrow_str(m)?,
-                    None => "\"\"".into(),
-                };
-                out.push_str(&format!("{}pyrt::raise({}, {});\n", ind, rust_str(name), m));
+                let code = self.raise_code(name, msg.as_ref())?;
+                out.push_str(&format!("{}{};\n", ind, code));
+            }
+            StmtKind::Assert(c, m) if self.catches(&["AssertionError"]) => {
+                let cv = self.cond(c)?;
+                let code = self.raise_code("AssertionError", m.as_ref())?;
+                out.push_str(&format!("{}if !({}) {{\n{}    {};\n{}}}\n", ind, cv, ind, code, ind));
             }
             StmtKind::Assert(c, m) => {
                 let cv = self.cond(c)?;
@@ -940,6 +1513,12 @@ impl<'a> FGen<'a> {
                     None => out.push_str(&format!("{}assert!({});\n", ind, cv)),
                 }
             }
+            StmtKind::LetSome(v, place, body) => {
+                let l = self.let_some(*v, place)?;
+                out.push_str(&format!("{}{} else {{\n", ind, l));
+                self.block(body, &inner, out)?;
+                out.push_str(&format!("{}}};\n", ind));
+            }
             StmtKind::Del(e) => {
                 let ExprKind::Index(b, k) = &e.kind else { unreachable!() };
                 let base = self.ex(b)?;
@@ -950,10 +1529,149 @@ impl<'a> FGen<'a> {
                     }
                     _ => {
                         let kb = self.borrow(k)?;
-                        out.push_str(&format!("{}pyrt::dict_pop({}, {});\n", ind, self.mut_ref_of(&base), kb));
+                        let c = self.may_fail("KeyError", "dict_pop", format!("{}, {}", self.mut_ref_of(&base), kb));
+                        out.push_str(&format!("{}{};\n", ind, c));
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// ```text
+    /// 'ok: {
+    ///     let e = 'body: { BODY; ELSE; break 'ok; };   // an exception: break 'body e
+    ///     match e { e if e.is("ValueError") => { .. } e => <pass it on> }
+    /// }
+    /// FINALLY
+    /// ```
+    /// Leaving `'ok` on success lets rustc see what the body assigned.
+    fn loop_enter(&mut self) {
+        self.loopn += 1;
+        let l = if self.loopn == 1 { "'outer".to_string() } else { format!("'outer{}", self.loopn) };
+        self.loops.push((l, false, 0));
+    }
+
+    /// `'label: ` if a break / continue needed it
+    fn loop_exit(&mut self) -> String {
+        let (l, used, _) = self.loops.pop().unwrap();
+        if used {
+            format!("{}: ", l)
+        } else {
+            String::new()
+        }
+    }
+
+    /// ` 'label` when break / continue crosses a labeled block (a try)
+    fn loop_label(&mut self) -> String {
+        match self.loops.last_mut() {
+            Some((l, used, n)) if *n > 0 => {
+                *used = true;
+                format!(" {}", l)
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn try_stmt(&mut self, body: &[Stmt], hs: &[Handler], orelse: &[Stmt], fin: &[Stmt], ind: &str, out: &mut String) -> Res<()> {
+        if let Some(l) = self.loops.last_mut() {
+            l.2 += 1;
+        }
+        let r = self.try_stmt_(body, hs, orelse, fin, ind, out);
+        if let Some(l) = self.loops.last_mut() {
+            l.2 -= 1;
+        }
+        r
+    }
+
+    fn try_stmt_(&mut self, body: &[Stmt], hs: &[Handler], orelse: &[Stmt], fin: &[Stmt], ind: &str, out: &mut String) -> Res<()> {
+        let inner = format!("{}    ", ind);
+        let inner2 = format!("{}    ", inner);
+        self.tries += 1;
+        let n = if self.tries == 1 { String::new() } else { self.tries.to_string() };
+        let (lbody, lok) = (format!("'body{}", n), format!("'ok{}", n));
+        self.ctx.push((exc::try_catchers(hs, fin), Some(lbody.clone())));
+        let mut b = String::new();
+        self.block(body, &inner2, &mut b)?;
+        self.ctx.pop();
+        if !b.contains(&format!("{} ", lbody)) && !b.contains(&format!("{})", lbody)) && !b.contains(&format!("{};", lbody)) {
+            // nothing in the body can raise what is caught
+            for line in b.lines() {
+                out.push_str(line.strip_prefix("        ").unwrap_or(line));
+                out.push('\n');
+            }
+            self.block(orelse, ind, out)?;
+            self.block(fin, ind, out)?;
+            return Ok(());
+        }
+        let has_fin = !fin.is_empty();
+        let all = hs.iter().any(|h| h.kinds.iter().any(|k| k == "BaseException" || k == "Exception"));
+        // with finally, an exception no handler takes waits for it in `pending`
+        let pend = has_fin && !all;
+        let exits = always_exits(body);
+        let mut code = String::new();
+        code += &format!("{}let e = {}: {{\n{}", inner, lbody, b);
+        if !exits {
+            self.block(orelse, &inner2, &mut code)?;
+            code += &format!("{}break {}{};\n", inner2, lok, if pend { " None" } else { "" });
+        }
+        code += &format!("{}}};\n", inner);
+        let mut arms = String::new();
+        for h in hs {
+            let mut name = self.name(h.var);
+            if name == "_" {
+                name = "e".into();
+            }
+            self.renames.insert(h.var, name.clone());
+            self.kinds.insert(h.var, Kind::Place);
+            let catch_all = h.kinds.iter().any(|k| k == "BaseException" || k == "Exception");
+            let used = self.used.contains(&h.var) || body_reraises(&h.body);
+            let guard = if catch_all {
+                String::new()
+            } else {
+                format!(" if {}", h.kinds.iter().map(|k| format!("{}.is({:?})", name, k)).collect::<Vec<_>>().join(" || "))
+            };
+            let bind = if used || !guard.is_empty() { name.clone() } else { "_".into() };
+            let mut hb = String::new();
+            self.block(&h.body, &format!("{}    ", inner2), &mut hb)?;
+            if pend && !always_exits(&h.body) {
+                hb += &format!("{}    None\n", inner2);
+            }
+            arms += &format!("{}{}{} => {{\n{}{}}}\n", inner2, bind, guard, hb, inner2);
+            if catch_all {
+                break;
+            }
+        }
+        if !all {
+            let p = if pend { "Some(e)".to_string() } else { self.propagate("e") };
+            arms += &format!("{}e => {},\n", inner2, p);
+        }
+        // a single catch-all handler needs no match
+        let simple = hs.len() == 1 && all && !pend;
+        if simple {
+            let h = &hs[0];
+            let name = self.name(h.var);
+            let mut hb = String::new();
+            self.block(&h.body, &inner, &mut hb)?;
+            code = code.replacen(&format!("{}let e = ", inner), &format!("{}let {} = ", inner, if self.used.contains(&h.var) || body_reraises(&h.body) { name } else { "_".into() }), 1);
+            code += &hb;
+        } else {
+            code += &format!("{}match e {{\n{}{}}}\n", inner, arms, inner);
+        }
+        if exits {
+            // the body never finishes normally: no 'ok block
+            let c: String = code.lines().map(|l| format!("{}\n", l.strip_prefix("    ").unwrap_or(l))).collect();
+            out.push_str(&c);
+            self.block(fin, ind, out)?;
+            return Ok(());
+        }
+        if pend {
+            out.push_str(&format!("{}let pending = {}: {{\n{}{}}};\n", ind, lok, code, ind));
+            self.block(fin, ind, out)?;
+            out.push_str(&format!("{}if let Some(e) = pending {{\n{}{};\n{}}}\n", ind, inner, self.propagate("e"), ind));
+        } else {
+            out.push_str(&format!("{}{}: {{\n{}{}}}\n", ind, lok, code, ind));
+            self.block(fin, ind, out)?;
         }
         Ok(())
     }
@@ -1030,13 +1748,14 @@ impl<'a> FGen<'a> {
     fn assign(&mut self, s: &Stmt, t: &Target, v: &Expr, ind: &str, out: &mut String) -> Res<()> {
         match t {
             Target::Var(w) => {
-                let val = self.owned(v)?;
+                let view = self.o.views[self.fid].contains(w);
+                let val = if view { self.borrow(v)? } else { self.owned(v)? };
                 let name = self.name(*w);
                 if self.decl.get(w) == Some(&Decl::At(s.id)) && !self.declared.contains(w) {
                     self.declared.insert(*w);
-                    self.kinds.insert(*w, Kind::Place);
+                    self.kinds.insert(*w, if view { Kind::Ref } else { Kind::Place });
                     let m = if self.muts.contains(w) { "mut " } else { "" };
-                    let ann = if needs_annotation(v) { format!(": {}", self.ty(&v.ty)) } else { String::new() };
+                    let ann = if needs_annotation(v) && !view { format!(": {}", self.ty(&v.ty)) } else { String::new() };
                     out.push_str(&format!("{}let {}{}{} = {};\n", ind, m, name, ann, val));
                 } else {
                     out.push_str(&format!("{}{} = {};\n", ind, name, val));
@@ -1093,7 +1812,7 @@ impl<'a> FGen<'a> {
                     }
                 }
                 Target::Place(pl) => {
-                    let code = R { code: part, kind: Kind::Val, prec: ATOM };
+                    let code = r(part, Kind::Val, ATOM);
                     self.store_code(pl, code, ind, out)?;
                 }
                 Target::Tuple(_) => self.assign_parts(s, t, &part, ind, out)?,
@@ -1105,7 +1824,7 @@ impl<'a> FGen<'a> {
     /// `xs[i] = v`, `d[k] = v`, `obj.f = v`
     fn store(&mut self, pl: &Expr, v: &Expr, ind: &str, out: &mut String) -> Res<()> {
         let val = self.owned(v)?;
-        self.store_code(pl, R { code: val, kind: Kind::Val, prec: LOW }, ind, out)
+        self.store_code(pl, r(val, Kind::Val, LOW), ind, out)
     }
 
     fn store_code(&mut self, pl: &Expr, val: R, ind: &str, out: &mut String) -> Res<()> {
@@ -1134,7 +1853,12 @@ impl<'a> FGen<'a> {
                     }
                     return Ok(());
                 }
-                let obj = self.ex(o)?;
+                if self.is_enum(&o.ty) {
+                    let obj = self.ex_mut(o)?;
+                    out.push_str(&format!("{}*{}.{}_mut() = {};\n", ind, par(&obj, ATOM), f, val.code));
+                    return Ok(());
+                }
+                let obj = self.ex_mut(o)?;
                 out.push_str(&format!("{}{}.{} = {};\n", ind, par(&obj, ATOM), ident(f), val.code));
             }
             _ => return err(pl.line, "unsupported assignment target"),
@@ -1185,14 +1909,26 @@ impl<'a> FGen<'a> {
         }
         let target = match &t.kind {
             ExprKind::Field(o, f) if self.init_field(o, f).is_some() => {
-                R { code: self.init_field(o, f).unwrap(), kind: Kind::Place, prec: ATOM }
+                r(self.init_field(o, f).unwrap(), Kind::Place, ATOM)
             }
             ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(..)) => {
-                let base = self.ex(b)?;
+                let base = self.ex_mut(b)?;
                 let kb = self.borrow(k)?;
-                R { code: format!("{}[{}]", par(&base, ATOM), kb), kind: Kind::Place, prec: ATOM }
+                if self.catches(&["KeyError"]) {
+                    let c = self.wrap(format!("pyrt::try_key_mut({}, {})", self.mut_ref_of(&base), kb));
+                    r(format!("*{}", c), Kind::Place, UNARY)
+                } else {
+                    r(format!("{}[{}]", par(&base, ATOM), kb), Kind::Place, ATOM)
+                }
             }
-            _ => self.ex(t)?,
+            _ => {
+                let x = self.ex_mut(t)?;
+                if x.kind == Kind::Mut {
+                    r(format!("*{}", x.code), Kind::Place, UNARY)
+                } else {
+                    x
+                }
+            }
         };
         let line = self.aug_code(&target, &t.ty, op, v)?;
         out.push_str(&format!("{}{}\n", ind, line));
@@ -1225,7 +1961,7 @@ impl<'a> FGen<'a> {
                 if native {
                     Ok(format!("{} {}= {};", tc, crate::front::opstr(op), rhs.code))
                 } else {
-                    let cur = R { code: tc.clone(), kind: Kind::Place, prec: ATOM };
+                    let cur = r(tc.clone(), Kind::Place, ATOM);
                     let e = self.arith(op, ty, &cur, ty, &rhs, v)?;
                     Ok(format!("{} = {};", tc, e.code))
                 }
@@ -1265,10 +2001,83 @@ impl<'a> FGen<'a> {
 
     // ----------------------------------------------------------- expressions
 
-    /// A condition (bool).
+    /// A condition (bool); narrowing tests become `let Some(x) = ..` (let chains).
     fn cond(&mut self, e: &Expr) -> Res<String> {
-        let v = self.val(e)?;
-        Ok(v.code)
+        match &e.kind {
+            ExprKind::IsSome(x, true, Some(v)) => self.let_some(*v, x),
+            ExprKind::IsInst(x, d, Some(v)) => self.let_variant(*v, x, *d),
+            ExprKind::And(xs) if matches!(xs[0].kind, ExprKind::IsSome(_, true, Some(_)) | ExprKind::IsInst(_, _, Some(_))) => {
+                let mut parts = vec![];
+                for x in xs {
+                    if let ExprKind::IsSome(p, true, Some(v)) = &x.kind {
+                        parts.push(self.let_some(*v, p)?);
+                    } else if let ExprKind::IsInst(p, d, Some(v)) = &x.kind {
+                        parts.push(self.let_variant(*v, p, *d)?);
+                    } else {
+                        let c = self.val(x)?;
+                        parts.push(par(&c, AND + 1));
+                    }
+                }
+                Ok(parts.join(" && "))
+            }
+            _ => Ok(self.val(e)?.code),
+        }
+    }
+
+    /// `let C::D(v) = &place` for `isinstance(place, D)`.
+    fn let_variant(&mut self, v: VarId, place: &Expr, d: ClassId) -> Res<String> {
+        let Ty::Class(c) = place.ty else { unreachable!() };
+        if !instantiated(self.p).contains(&d) {
+            return err(place.line, format!("`{}` is never created, so this isinstance() is always false", self.p.classes[d].name));
+        }
+        if !self.p.classes[d].subs.is_empty() {
+            let p = self.ex(place)?;
+            self.kinds.insert(v, Kind::Place);
+            return Ok(format!("let Some({}) = {}.as_{}()", self.name(v), par(&p, ATOM), snake(&self.p.classes[d].name)));
+        }
+        let l = self.let_some(v, place)?;
+        let ctor = format!("{}::{}", self.p.classes[c].name, self.p.classes[d].name);
+        Ok(l.replacen("let Some(", &format!("let {}(", ctor), 1))
+    }
+
+    /// `let Some(v) = &place`, binding `v` by value, reference or mutable reference.
+    fn let_some(&mut self, v: VarId, place: &Expr) -> Res<String> {
+        let p = self.ex(place)?;
+        let ty = self.f.vars[v].ty.clone();
+        // `while cur is not None: ... cur = cur.next`: the value needs its own name
+        if let ExprKind::Var(root) = place.kind {
+            if self.region.contains(&root) && self.f.vars[root].name == self.f.vars[v].name {
+                let taken: HashSet<&str> = self.f.vars.iter().map(|x| x.name.as_str()).collect();
+                let alt = match &ty {
+                    Ty::Class(c) => snake(&self.p.classes[*c].name),
+                    _ => String::new(),
+                };
+                let n = if !alt.is_empty() && !taken.contains(alt.as_str()) { alt } else { format!("{}_", self.f.vars[v].name) };
+                self.renames.insert(v, n);
+            }
+        }
+        let name = self.name(v);
+        let (src, k) = if ty.is_copy() {
+            (self.val_r(p).code, Kind::Place)
+        } else if self.o.via[self.fid].contains(&v) {
+            (match p.kind {
+                Kind::Mut => format!("&mut *{}", par(&p, UNARY)),
+                _ => format!("&mut {}", par(&p, UNARY)),
+            }, Kind::Mut)
+        } else {
+            (match p.kind {
+                Kind::Ref => p.code.clone(),
+                Kind::Mut => format!("&*{}", par(&p, UNARY)),
+                _ => format!("&{}", par(&p, UNARY)),
+            }, Kind::Ref)
+        };
+        self.kinds.insert(v, k);
+        if let Ty::Class(c) = ty {
+            if recursive(self.p, c) {
+                self.boxed.insert(v);
+            }
+        }
+        Ok(format!("let Some({}) = {}", name, src))
     }
 
     fn kind_of(&self, v: VarId) -> Kind {
@@ -1297,6 +2106,12 @@ impl<'a> FGen<'a> {
             return Ok(format!("if {} {{ {} }} else {{ {} }}", cv, av, bv));
         }
         let x = self.ex(e)?;
+        if self.o.takes.contains(&e.id) {
+            return Ok(match e.ty {
+                Ty::Optional(_) => format!("{}.take()", par(&x, ATOM)),
+                _ => format!("std::mem::take({})", self.mut_ref_of(&x)),
+            });
+        }
         Ok(self.owned_r(&x, &e.ty, self.o.moves.contains(&e.id)))
     }
 
@@ -1308,6 +2123,7 @@ impl<'a> FGen<'a> {
             Kind::Val => x.code.clone(),
             Kind::Place if moved => x.code.clone(),
             Kind::Place => format!("{}.clone()", par(x, ATOM)),
+            Kind::Ref | Kind::Mut if x.boxed => format!("(**{}).clone()", par(x, UNARY)),
             Kind::Ref | Kind::Mut => match t {
                 Ty::Str => format!("{}.to_string()", par(x, ATOM)),
                 Ty::List(_) => format!("{}.to_vec()", par(x, ATOM)),
@@ -1373,7 +2189,60 @@ impl<'a> FGen<'a> {
             K::Bool(b) => r(b.to_string(), Kind::Val, ATOM),
             K::Str(s) => r(rust_str(s), Kind::Ref, ATOM),
             K::NoneLit => r("()", Kind::Val, ATOM),
-            K::Var(v) => r(self.name(*v), self.kind_of(*v), ATOM),
+            K::Var(v) => {
+                let mut x = r(self.name(*v), self.kind_of(*v), ATOM);
+                x.boxed = self.boxed.contains(v);
+                x
+            }
+            K::NoneVal => r("None", Kind::Val, ATOM),
+            K::Upcast(x) => {
+                let Ty::Class(c) = e.ty else { unreachable!() };
+                // Upcast(Upcast(y)): straight to the outer class
+                let x = match &x.kind {
+                    K::Upcast(y) => y,
+                    _ => x,
+                };
+                let v = self.owned(x)?;
+                let cname = &self.p.classes[c].name;
+                match x.ty {
+                    Ty::Class(k) if !self.p.classes[k].subs.is_empty() => r(format!("{}::from({})", cname, v), Kind::Val, ATOM),
+                    Ty::Class(k) | Ty::Obj(k) => r(format!("{}::{}({})", cname, self.p.classes[k].name, v), Kind::Val, ATOM),
+                    _ => unreachable!(),
+                }
+            }
+            K::IsInst(x, d, _) => {
+                let Ty::Class(c) = x.ty else { unreachable!() };
+                let inst = instantiated(self.p);
+                let vs: Vec<String> = self
+                    .p
+                    .subtree(*d)
+                    .into_iter()
+                    .filter(|k| inst.contains(k))
+                    .map(|k| format!("{}::{}(_)", self.p.classes[c].name, self.p.classes[k].name))
+                    .collect();
+                if vs.is_empty() {
+                    r("false", Kind::Val, ATOM)
+                } else {
+                    let xv = self.ex(x)?;
+                    r(format!("matches!({}, {})", xv.code, vs.join(" | ")), Kind::Val, ATOM)
+                }
+            }
+            K::SuperInit(fid, args) => {
+                let b = self.p.funcs[*fid].class.unwrap();
+                let a = self.args(*fid, args)?;
+                r(self.call_result(*fid, format!("{}::init({})", self.p.classes[b].name, a)), Kind::Val, ATOM)
+            }
+            K::SomeOf(x) => {
+                let v = self.owned(x)?;
+                match &x.ty {
+                    Ty::Class(c) if recursive(self.p, *c) => r(format!("Some(Box::new({}))", v), Kind::Val, ATOM),
+                    _ => r(format!("Some({})", v), Kind::Val, ATOM),
+                }
+            }
+            K::IsSome(x, some, _) => {
+                let v = self.ex(x)?;
+                r(format!("{}.{}()", par(&v, ATOM), if *some { "is_some" } else { "is_none" }), Kind::Val, ATOM)
+            }
             K::Const(c) => {
                 let cst = &self.p.consts[*c];
                 let k = if cst.value.ty == Ty::Str { Kind::Ref } else { Kind::Val };
@@ -1423,19 +2292,20 @@ impl<'a> FGen<'a> {
                     None => ident(&f.name),
                 };
                 let a = self.args(*fid, args)?;
-                r(format!("{}({})", name, a), Kind::Val, ATOM)
+                r(self.call_result(*fid, format!("{}({})", name, a)), Kind::Val, ATOM)
             }
             K::Method(recv, fid, args) => {
-                let rv = self.ex(recv)?;
+                let rv = if self.o.self_mut[*fid] { self.ex_mut(recv)? } else { self.ex(recv)? };
                 let a = self.args(*fid, args)?;
                 let name = ident(&self.p.funcs[*fid].name);
-                r(format!("{}.{}({})", par(&rv, ATOM), name, a), Kind::Val, ATOM)
+                r(self.call_result(*fid, format!("{}.{}({})", par(&rv, ATOM), name, a)), Kind::Val, ATOM)
             }
             K::New(c, args) => {
                 let cl = &self.p.classes[*c];
+                let sname = struct_name(self.p, *c);
                 if let Some(init) = cl.init {
                     let a = self.args(init, args)?;
-                    r(format!("{}::new({})", cl.name, a), Kind::Val, ATOM)
+                    r(self.call_result(init, format!("{}::new({})", sname, a)), Kind::Val, ATOM)
                 } else {
                     let mut fs = vec![];
                     for (fd, a) in cl.fields.iter().zip(args.iter()) {
@@ -1448,9 +2318,9 @@ impl<'a> FGen<'a> {
                         }
                     }
                     if fs.is_empty() {
-                        r(format!("{} {{}}", cl.name), Kind::Val, ATOM)
+                        r(format!("{} {{}}", sname), Kind::Val, ATOM)
                     } else {
-                        r(format!("{} {{ {} }}", cl.name, fs.join(", ")), Kind::Val, ATOM)
+                        r(format!("{} {{ {} }}", sname, fs.join(", ")), Kind::Val, ATOM)
                     }
                 }
             }
@@ -1459,6 +2329,10 @@ impl<'a> FGen<'a> {
                     return Ok(r(local, Kind::Place, ATOM));
                 }
                 let ov = self.ex(o)?;
+                if self.is_enum(&o.ty) {
+                    let k = if e.ty.is_copy() { Kind::Val } else { Kind::Ref };
+                    return Ok(r(format!("{}.{}()", par(&ov, ATOM), f), k, ATOM));
+                }
                 r(format!("{}.{}", par(&ov, ATOM), ident(f)), Kind::Place, ATOM)
             }
             K::TupleField(o, i) => {
@@ -1470,7 +2344,11 @@ impl<'a> FGen<'a> {
                 match &b.ty {
                     Ty::Str => {
                         let i = self.val(k)?;
-                        r(format!("pyrt::str_at({}, {})", self.borrow_r(&base), i.code), Kind::Val, ATOM)
+                        r(self.may_fail("IndexError", "str_at", format!("{}, {}", self.borrow_r(&base), i.code)), Kind::Val, ATOM)
+                    }
+                    Ty::Dict(..) if self.catches(&["KeyError"]) => {
+                        let kb = self.borrow(k)?;
+                        r(self.wrap(format!("pyrt::try_key({}, {})", self.borrow_r(&base), kb)), Kind::Ref, ATOM)
                     }
                     Ty::Dict(..) => {
                         let kb = self.borrow(k)?;
@@ -1556,8 +2434,113 @@ impl<'a> FGen<'a> {
         })
     }
 
+    /// Is an exception of one of these classes handled here (caught by a try
+    /// around it, or by a caller)?
+    fn catches<S: AsRef<str>>(&self, kinds: &[S]) -> bool {
+        kinds.iter().any(|k| self.ctx.iter().any(|(c, _)| exc::caught(self.p, k.as_ref(), c)))
+    }
+
+    /// A `Result` expression whose error is handled here: `x?` or `check!`.
+    fn wrap(&self, code: String) -> String {
+        match self.ctx.iter().rev().find_map(|c| c.1.clone()) {
+            Some(l) => format!("pyrt::check!({}, {})", code, l),
+            None => format!("{}?", code),
+        }
+    }
+
+    /// `pyrt::try_f(args)` when `kind` is handled here, else `pyrt::f(args)`.
+    fn may_fail(&self, kind: &str, f: &str, args: String) -> String {
+        if self.catches(&[kind]) {
+            self.wrap(format!("pyrt::try_{}({})", f, args))
+        } else {
+            format!("pyrt::{}({})", f, args)
+        }
+    }
+
+    /// A call of a user function that returns Result.
+    fn call_result(&self, g: FuncId, code: String) -> String {
+        if !self.x.fallible[g] {
+            return code;
+        }
+        let ks: Vec<String> = self.x.may[g].iter().cloned().collect();
+        if self.catches(&ks) {
+            self.wrap(code)
+        } else {
+            OR_RAISE.with(|c| c.set(true));
+            format!("{}.or_raise()", code)
+        }
+    }
+
+    /// Pass an exception on: to the enclosing try, the caller, or the top.
+    fn propagate(&self, e: &str) -> String {
+        match self.ctx.iter().rev().find_map(|c| c.1.clone()) {
+            Some(l) => format!("break {} {}", l, e),
+            None if self.x.fallible[self.fid] => format!("return Err({})", e),
+            None => format!("pyrt::uncaught({})", e),
+        }
+    }
+
+    /// `raise K(msg)`
+    fn raise_code(&mut self, kind: &str, msg: Option<&Expr>) -> Res<String> {
+        // str(KeyError(k)) is repr(k)
+        let key = exc::chain(self.p, kind).iter().any(|k| k == "KeyError");
+        let m = match msg {
+            Some(m) if key => format!("&pyrt::repr({})", self.borrow_str(m)?),
+            Some(m) => self.borrow_str(m)?,
+            None => "\"\"".into(),
+        };
+        if self.catches(&[kind]) {
+            PYERR.with(|c| c.set(true));
+            EXC_USED.with(|c| c.borrow_mut().insert(kind.to_string()));
+            return Ok(self.propagate(&format!("PyErr::new({}, {})", exc_const(kind), m)));
+        }
+        Ok(format!("pyrt::raise({}, {})", rust_str(kind), m))
+    }
+
+    fn is_enum(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Class(c) if !self.p.classes[*c].subs.is_empty())
+    }
+
+    /// An expression about to be modified: a field of a value that may be any
+    /// subclass goes through its `_mut` accessor.
+    fn ex_mut(&mut self, e: &Expr) -> Res<R> {
+        match &e.kind {
+            ExprKind::Field(o, f) if self.init_field(o, f).is_none() => {
+                let ov = self.ex_mut(o)?;
+                if self.is_enum(&o.ty) {
+                    return Ok(r(format!("{}.{}_mut()", par(&ov, ATOM), f), Kind::Mut, ATOM));
+                }
+                Ok(r(format!("{}.{}", par(&ov, ATOM), ident(f)), Kind::Place, ATOM))
+            }
+            ExprKind::TupleField(o, i) => {
+                let ov = self.ex_mut(o)?;
+                Ok(r(format!("{}.{}", par(&ov, ATOM), i), Kind::Place, ATOM))
+            }
+            ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(..)) => {
+                let base = self.ex_mut(b)?;
+                let kb = self.borrow(k)?;
+                if self.catches(&["KeyError"]) {
+                    let c = self.wrap(format!("pyrt::try_key_mut({}, {})", self.mut_ref_of(&base), kb));
+                    Ok(r(c, Kind::Mut, ATOM))
+                } else {
+                    Ok(r(format!("{}[{}]", par(&base, ATOM), kb), Kind::Place, ATOM))
+                }
+            }
+            ExprKind::Index(b, k) if matches!(b.ty, Ty::List(_)) => {
+                let base = self.ex_mut(b)?;
+                let i = self.index_code(&base, k)?;
+                Ok(r(format!("{}[{}]", par(&base, ATOM), i), Kind::Place, ATOM))
+            }
+            _ => self.ex(e),
+        }
+    }
+
     /// Rust index for a list index expression.
     fn index_code(&mut self, base: &R, k: &Expr) -> Res<String> {
+        if self.catches(&["IndexError"]) {
+            let i = self.val(k)?;
+            return Ok(self.wrap(format!("pyrt::try_idx({}, {}.len())", i.code, par(base, ATOM))));
+        }
         if let ExprKind::Int(v) = k.kind {
             if v >= 0 {
                 return Ok(v.to_string());
@@ -1585,9 +2568,27 @@ impl<'a> FGen<'a> {
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr, e: &Expr) -> Res<R> {
         match (&a.ty, &b.ty) {
             (Ty::Str, Ty::Str) => {
-                // a + b
-                let (x, y) = (self.ex(a)?, self.ex(b)?);
-                return Ok(r(format!("format!(\"{{}}{{}}\", {}, {})", x.code, y.code), Kind::Val, ATOM));
+                // a + b (+ c ...) as one format!
+                let mut parts = vec![];
+                fn flat<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+                    match &e.kind {
+                        ExprKind::Bin(BinOp::Add, x, y) if x.ty == Ty::Str => {
+                            flat(x, out);
+                            flat(y, out);
+                        }
+                        _ => out.push(e),
+                    }
+                }
+                flat(a, &mut parts);
+                flat(b, &mut parts);
+                let mut fmt = String::new();
+                let mut args = vec![];
+                for x in parts {
+                    let (f, xs) = self.fmt_piece(x)?;
+                    fmt += &f;
+                    args.extend(xs);
+                }
+                return Ok(r(format!("format!(\"{}\", {})", fmt, args.join(", ")), Kind::Val, ATOM));
             }
             (Ty::Str, Ty::Int) => {
                 let s = self.borrow_str(a)?;
@@ -1657,6 +2658,17 @@ impl<'a> FGen<'a> {
             BitAnd => bin("&", BAND),
             BitOr => bin("|", BOR),
             BitXor => bin("^", BXOR),
+            Div | FloorDiv | Mod if !self.nonzero_lit(b) && self.catches(&["ZeroDivisionError"]) => {
+                let f = match (op, int) {
+                    (Div, true) => return Ok(r(self.wrap(format!("pyrt::try_div({} as f64, {} as f64)", par(x, CAST), par(y, CAST))), Kind::Val, ATOM)),
+                    (Div, false) => "div",
+                    (FloorDiv, true) => "floordiv",
+                    (FloorDiv, false) => "ffloordiv",
+                    (_, true) => "modulo",
+                    _ => "fmod",
+                };
+                r(self.wrap(format!("pyrt::try_{}({}, {})", f, x.code, y.code)), Kind::Val, ATOM)
+            }
             Div if int => {
                 if self.nonzero_lit(b) {
                     r(format!("{} as f64 / {}", par(x, CAST), float_lit(match b.kind { ExprKind::Int(v) => v as f64, _ => 1.0 })), Kind::Val, MUL)
@@ -1816,7 +2828,7 @@ impl<'a> FGen<'a> {
                 Mode::Owned => self.owned(a)?,
                 Mode::Ref => self.borrow(a)?,
                 Mode::Mut => {
-                    let x = self.ex(a)?;
+                    let x = self.ex_mut(a)?;
                     self.mut_ref_of(&x)
                 }
             };
@@ -1937,7 +2949,11 @@ impl<'a> FGen<'a> {
                     Ty::Dict(..) => (format!("{}.keys()", par(&c, ATOM)), Item::Ref),
                     _ if c.kind == Kind::Val => {
                         if for_loop {
-                            (c.code, Item::Val)
+                            let code = match c.code.strip_prefix("vec!") {
+                                Some(arr) if matches!(x.kind, ExprKind::List(_)) => arr.to_string(),
+                                _ => c.code,
+                            };
+                            (code, Item::Val)
                         } else {
                             (format!("{}.into_iter()", par(&c, ATOM)), Item::Val)
                         }
@@ -2407,7 +3423,7 @@ impl<'a> FGen<'a> {
                 }
                 let (code, item) = self.iter_arg(&a[0])?;
                 let t = &a[0].ty;
-                let x = R { code: "x".into(), kind: if matches!(item, Item::Ref) { Kind::Ref } else { Kind::Place }, prec: ATOM };
+                let x = r("x", if matches!(item, Item::Ref) { Kind::Ref } else { Kind::Place }, ATOM);
                 let test = truth_of(t, &self.val_r(x.clone()), &x);
                 v(format!("{}.{}(|x| {})", code, name, test))
             }
@@ -2464,14 +3480,20 @@ impl<'a> FGen<'a> {
                 v(format!("pyrt::repr({})", b))
             }
             "int" => match &a[0].ty {
-                Ty::Str => v(format!("pyrt::int_str({})", self.borrow_str(&a[0])?)),
+                Ty::Str => {
+                    let s = self.borrow_str(&a[0])?;
+                    v(self.may_fail("ValueError", "int_str", s))
+                }
                 Ty::Float => v(format!("pyrt::int_float({})", self.val(&a[0])?.code)),
                 _ => {
                     let x = self.val(&a[0])?;
                     r(format!("{} as i64", par(&x, CAST)), Kind::Val, CAST)
                 }
             },
-            "float" => v(format!("pyrt::float_str({})", self.borrow_str(&a[0])?)),
+            "float" => {
+                let s = self.borrow_str(&a[0])?;
+                v(self.may_fail("ValueError", "float_str", s))
+            }
             "round" => v(format!("pyrt::round({})", self.val(&a[0])?.code)),
             "round2" => {
                 let x = self.val(&a[0])?;
@@ -2552,12 +3574,13 @@ impl<'a> FGen<'a> {
             "hypot" => v(format!("{}.hypot({})", recv(&vs[0]), vs[1].code)),
             "copysign" => v(format!("{}.copysign({})", recv(&vs[0]), vs[1].code)),
             "log2args" => v(format!("pyrt::math::log_base({}, {})", vs[0].code, vs[1].code)),
+            "sqrt" | "log" if self.catches(&["ValueError"]) => v(self.wrap(format!("pyrt::try_{}({})", n, vs[0].code))),
             _ => v(format!("pyrt::math::{}({})", n, vs.iter().map(|x| x.code.clone()).collect::<Vec<_>>().join(", "))),
         })
     }
 
     fn list_method(&mut self, m: &str, a: &[Expr], e: &Expr) -> Res<R> {
-        let recv = self.ex(&a[0])?;
+        let recv = if mutating_builtin(&format!("list.{}", m)) { self.ex_mut(&a[0])? } else { self.ex(&a[0])? };
         let rc = par(&recv, ATOM);
         let v = |c: String| r(c, Kind::Val, ATOM);
         let et = match &a[0].ty {
@@ -2576,22 +3599,19 @@ impl<'a> FGen<'a> {
                     v(format!("pyrt::insert({}, {}, {})", self.mut_ref_of(&recv), i.code, x))
                 }
             }
+            "pop" if self.catches(&["IndexError"]) => v(self.wrap(format!("pyrt::try_pop({})", self.mut_ref_of(&recv)))),
             "pop" => v(format!("{}.pop().expect(\"IndexError: pop from empty list\")", rc)),
             "pop_at" => {
-                if let ExprKind::Int(0) = a[1].kind {
-                    v(format!("pyrt::pop_at({}, 0)", self.mut_ref_of(&recv)))
-                } else {
-                    let i = self.val(&a[1])?;
-                    v(format!("pyrt::pop_at({}, {})", self.mut_ref_of(&recv), i.code))
-                }
+                let i = self.val(&a[1])?;
+                v(self.may_fail("IndexError", "pop_at", format!("{}, {}", self.mut_ref_of(&recv), i.code)))
             }
             "remove" => {
                 let x = self.owned(&a[1])?;
-                v(format!("pyrt::remove({}, &{})", self.mut_ref_of(&recv), x))
+                v(self.may_fail("ValueError", "remove", format!("{}, &{}", self.mut_ref_of(&recv), x)))
             }
             "index" => {
                 let x = self.owned(&a[1])?;
-                v(format!("pyrt::index({}, &{})", self.borrow_r(&recv), x))
+                v(self.may_fail("ValueError", "index", format!("{}, &{}", self.borrow_r(&recv), x)))
             }
             "count" => {
                 let x = self.owned(&a[1])?;
@@ -2632,7 +3652,7 @@ impl<'a> FGen<'a> {
     }
 
     fn dict_method(&mut self, m: &str, a: &[Expr], e: &Expr) -> Res<R> {
-        let recv = self.ex(&a[0])?;
+        let recv = if mutating_builtin(&format!("dict.{}", m)) { self.ex_mut(&a[0])? } else { self.ex(&a[0])? };
         let rc = par(&recv, ATOM);
         let v = |c: String| r(c, Kind::Val, ATOM);
         Ok(match m {
@@ -2642,9 +3662,14 @@ impl<'a> FGen<'a> {
                 let how = if e.ty.is_copy() { "copied" } else { "cloned" };
                 v(format!("{}.get({}).{}().unwrap_or({})", rc, k, how, d))
             }
+            "get_opt" => {
+                let k = self.borrow(&a[1])?;
+                let how = if e.ty.is_copy() { "copied" } else { "cloned" };
+                v(format!("{}.get({}).{}()", rc, k, how))
+            }
             "pop" => {
                 let k = self.borrow(&a[1])?;
-                v(format!("pyrt::dict_pop({}, {})", self.mut_ref_of(&recv), k))
+                v(self.may_fail("KeyError", "dict_pop", format!("{}, {}", self.mut_ref_of(&recv), k)))
             }
             "pop_default" => {
                 let k = self.borrow(&a[1])?;
@@ -2667,14 +3692,14 @@ impl<'a> FGen<'a> {
     }
 
     fn set_method(&mut self, m: &str, a: &[Expr]) -> Res<R> {
-        let recv = self.ex(&a[0])?;
+        let recv = if mutating_builtin(&format!("set.{}", m)) { self.ex_mut(&a[0])? } else { self.ex(&a[0])? };
         let rc = par(&recv, ATOM);
         let v = |c: String| r(c, Kind::Val, ATOM);
         Ok(match m {
             "add" => v(format!("{}.insert({})", rc, self.owned(&a[1])?)),
             "remove" => {
                 let x = self.borrow(&a[1])?;
-                v(format!("pyrt::set_remove({}, {})", self.mut_ref_of(&recv), x))
+                v(self.may_fail("KeyError", "set_remove", format!("{}, {}", self.mut_ref_of(&recv), x)))
             }
             "discard" => {
                 let x = self.borrow(&a[1])?;
@@ -2729,7 +3754,11 @@ impl<'a> FGen<'a> {
                 let f = if m == "count" { "count_str" } else { m };
                 v(format!("pyrt::{}({}, {})", f, sb, arg(self, 1)?))
             }
-            "index" | "rindex" => v(format!("pyrt::{}_str({}, {})", m, sb, arg(self, 1)?)),
+            "index" => {
+                let x = arg(self, 1)?;
+                v(self.may_fail("ValueError", "index_str", format!("{}, {}", sb, x)))
+            }
+            "rindex" => v(format!("pyrt::rindex_str({}, {})", sb, arg(self, 1)?)),
             "split_ws" | "splitlines" | "strip" | "lstrip" | "rstrip" | "isdigit" | "isdecimal" | "isnumeric"
             | "isalpha" | "isalnum" | "isspace" | "isupper" | "islower" | "title" | "capitalize" | "swapcase" => {
                 let f = match m {
@@ -2759,6 +3788,46 @@ fn truth_of(t: &Ty, val: &R, x: &R) -> String {
 fn unfmt(s: &str) -> String {
     // the literal text of a format string without arguments
     s.replace("{{", "{").replace("}}", "}").replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+/// Variables assigned (rebound) anywhere in `s`.
+fn assigned_vars(s: &[Stmt]) -> HashSet<VarId> {
+    let mut out = HashSet::new();
+    fn go(s: &[Stmt], out: &mut HashSet<VarId>) {
+        for x in s {
+            match &x.kind {
+                StmtKind::Assign(t, _) => {
+                    let mut v = vec![];
+                    t.vars(&mut v);
+                    out.extend(v);
+                }
+                StmtKind::AugVar(v, ..) => {
+                    out.insert(*v);
+                }
+                _ => {}
+            }
+            for b in x.blocks() {
+                go(b, out);
+            }
+        }
+    }
+    go(s, &mut out);
+    out
+}
+
+fn snake(name: &str) -> String {
+    let mut o = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                o.push('_');
+            }
+            o.extend(c.to_lowercase());
+        } else {
+            o.push(c);
+        }
+    }
+    o
 }
 
 /// The statement list that directly contains statement `id`.
@@ -2791,6 +3860,10 @@ fn assign_count(s: &[Stmt], v: VarId) -> u32 {
             StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
                 (if assign_count(a, v) > 0 { 2 } else { 0 }) + assign_count(b, v)
             }
+            StmtKind::Try(b, hs, e, f) => {
+                assign_count(b, v) + hs.iter().map(|h| assign_count(&h.body, v)).max().unwrap_or(0) + assign_count(e, v) + assign_count(f, v)
+            }
+            StmtKind::LetSome(_, _, b) => assign_count(b, v),
             _ => 0,
         };
     }
@@ -2824,12 +3897,16 @@ fn is_simple(e: &Expr) -> bool {
 /// `let x = ...` needs a type when inference would not find the Python one.
 fn needs_annotation(v: &Expr) -> bool {
     match &v.kind {
-        ExprKind::Int(_) => true,
+        ExprKind::Int(_) | ExprKind::NoneVal => true,
         ExprKind::List(x) | ExprKind::Set(x) => x.is_empty(),
         ExprKind::Dict(x) => x.is_empty(),
         ExprKind::Bin(..) | ExprKind::Unary(..) => all_literal(v),
         _ => false,
     }
+}
+
+fn body_reraises(s: &[Stmt]) -> bool {
+    s.iter().any(|x| matches!(x.kind, StmtKind::Reraise(_)) || x.blocks().iter().any(|b| body_reraises(b)))
 }
 
 /// Every path through `s` ends in return / raise / an endless loop.
@@ -2838,6 +3915,8 @@ fn always_exits(s: &[Stmt]) -> bool {
         Some(StmtKind::Return(_)) | Some(StmtKind::Raise(..)) => true,
         Some(StmtKind::If(_, a, b)) => always_exits(a) && always_exits(b),
         Some(StmtKind::While(c, body, _)) => matches!(c.kind, ExprKind::Bool(true)) && !has_break(body),
+        Some(StmtKind::Reraise(_)) => true,
+        Some(StmtKind::Try(b, hs, _, f)) => always_exits(f) || (always_exits(b) && hs.iter().all(|h| always_exits(&h.body))),
         _ => false,
     }
 }
@@ -2846,6 +3925,8 @@ fn has_break(s: &[Stmt]) -> bool {
     s.iter().any(|x| match &x.kind {
         StmtKind::Break => true,
         StmtKind::If(_, a, b) => has_break(a) || has_break(b),
+        StmtKind::Try(b, hs, e, f) => has_break(b) || hs.iter().any(|h| has_break(&h.body)) || has_break(e) || has_break(f),
+        StmtKind::LetSome(_, _, b) => has_break(b),
         _ => false,
     })
 }

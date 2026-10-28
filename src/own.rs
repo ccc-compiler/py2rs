@@ -34,6 +34,8 @@ pub struct Own {
     pub ret_alias: Vec<bool>,
     /// Var expressions whose value is moved
     pub moves: HashSet<u32>,
+    /// places moved out with `take` (overwritten before they are read again)
+    pub takes: HashSet<u32>,
     /// variables that need `mut`
     pub mut_vars: Vec<HashSet<VarId>>,
     /// loop variables assigned in the body
@@ -43,6 +45,10 @@ pub struct Own {
     /// variables live at the head of a loop (stmt id → vars)
     pub loop_live: HashMap<u32, HashSet<VarId>>,
     pub immutable: Vec<bool>,
+    /// variables written through (loop / narrowed variables: need `&mut`)
+    pub via: Vec<HashSet<VarId>>,
+    /// locals that only ever refer to existing values: `&T` instead of a copy
+    pub views: Vec<HashSet<VarId>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +56,8 @@ pub enum Step {
     Index,
     Field(String),
     Tuple(usize),
+    /// the value inside an Optional
+    Some,
 }
 
 type Path = Vec<Step>;
@@ -63,6 +71,8 @@ struct Mutation {
     deep: bool,
     pos: u32,
     line: u32,
+    /// the statement that modifies
+    sid: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +98,8 @@ pub fn analyze(p: &Program) -> Res<Own> {
         ret_alias: vec![false; p.funcs.len()],
         mut_vars: vec![HashSet::new(); p.funcs.len()],
         rebound: vec![HashSet::new(); p.funcs.len()],
+        via: vec![HashSet::new(); p.funcs.len()],
+        views: vec![HashSet::new(); p.funcs.len()],
         immutable: vec![false; p.classes.len()],
         ..Default::default()
     };
@@ -97,6 +109,33 @@ pub fn analyze(p: &Program) -> Res<Own> {
         let mut changed = false;
         for fid in 0..p.funcs.len() {
             let f = &p.funcs[fid];
+            if !f.dispatch.is_empty() {
+                // a dispatcher passes its arguments on: the most demanding mode wins
+                let rank = |m: Mode| match m {
+                    Mode::Copy => 0,
+                    Mode::Ref => 1,
+                    Mode::Mut => 2,
+                    Mode::Owned => 3,
+                };
+                for i in 0..f.params.len() {
+                    let m = f.dispatch.iter().map(|(_, x)| o.params[*x][i]).max_by_key(|m| rank(*m)).unwrap();
+                    let local = f.dispatch.iter().all(|(_, x)| o.params[*x][i] != Mode::Owned || o.owned_local[*x][i]);
+                    let local = m == Mode::Owned && local;
+                    if m != o.params[fid][i] || local != o.owned_local[fid][i] {
+                        o.params[fid][i] = m;
+                        o.owned_local[fid][i] = local;
+                        changed = true;
+                    }
+                }
+                let sm = f.dispatch.iter().any(|(_, x)| o.self_mut[*x]);
+                let ra = f.dispatch.iter().any(|(_, x)| o.ret_alias[*x]);
+                if sm != o.self_mut[fid] || ra != o.ret_alias[fid] {
+                    o.self_mut[fid] = sm;
+                    o.ret_alias[fid] = ra;
+                    changed = true;
+                }
+                continue;
+            }
             let (modes, self_m, ret_alias, self_escapes) = {
                 let mut a = Fn::new(p, &o, fid);
                 a.collect()?;
@@ -147,12 +186,20 @@ pub fn analyze(p: &Program) -> Res<Own> {
         }
     }
     for fid in 0..p.funcs.len() {
-        let (moves, muts, rebound, iter_mut, loop_live) = {
+        let (moves, muts, rebound, iter_mut, loop_live, via, takes) = {
             let mut a = Fn::new(p, &o, fid);
             a.collect()?;
             a.check()?;
-            a.results()
+            let via: HashSet<VarId> = a.muts.iter().map(|m| m.via).collect();
+            let takes = std::mem::take(&mut a.takes);
+            let views = a.views();
+            let (m, mu, r, i, l) = a.results();
+            (m, mu, r, i, l, via, (takes, views))
         };
+        let (takes, views) = takes;
+        o.views[fid] = views;
+        o.takes.extend(takes);
+        o.via[fid] = via;
         o.moves.extend(moves);
         o.mut_vars[fid] = muts;
         o.rebound[fid] = rebound;
@@ -194,11 +241,11 @@ fn class_immutability(p: &Program, o: &mut Own) {
                 }
             }
             match &st.kind {
-                StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
-                    walk(p, f, a, out);
-                    walk(p, f, b, out);
+                _ => {
+                    for b in st.blocks() {
+                        walk(p, f, b, out);
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -279,6 +326,7 @@ struct Fn<'a> {
     loop_live: HashMap<u32, HashSet<VarId>>,
     moves: HashSet<u32>,
     iter_mut: HashSet<u32>,
+    takes: HashSet<u32>,
     in_closure: u32,
     /// for loops: stmt id → (iterated root/path, loop vars)
     loop_iters: Vec<(u32, Option<(VarId, Path)>, Vec<VarId>, bool)>,
@@ -307,6 +355,7 @@ impl<'a> Fn<'a> {
             loop_live: HashMap::new(),
             moves: HashSet::new(),
             iter_mut: HashSet::new(),
+            takes: HashSet::new(),
             in_closure: 0,
             loop_iters: vec![],
             errors: vec![],
@@ -342,16 +391,16 @@ impl<'a> Fn<'a> {
             *n += 1;
             let start = *n;
             match &st.kind {
-                StmtKind::If(_, a, b) => {
-                    self.number(a, n);
-                    self.number(b, n);
-                }
                 StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
                     self.number(a, n);
                     self.loops.push((start, *n));
                     self.number(b, n);
                 }
-                _ => {}
+                _ => {
+                    for b in st.blocks() {
+                        self.number(b, n);
+                    }
+                }
             }
             self.pos.insert(st.id, (start, *n));
         }
@@ -452,6 +501,19 @@ impl<'a> Fn<'a> {
                     self.expr(m)
                 }
             }
+            StmtKind::LetSome(v, e, body) => {
+                self.expr(e);
+                self.bind_narrow(*v, e);
+                self.block(body);
+            }
+            StmtKind::Try(b, hs, e, f) => {
+                self.block(b);
+                for h in hs {
+                    self.block(&h.body);
+                }
+                self.block(e);
+                self.block(f);
+            }
             StmtKind::Del(e) => {
                 self.expr(e);
                 if let ExprKind::Index(b, _) = &e.kind {
@@ -520,7 +582,8 @@ impl<'a> Fn<'a> {
         let via = root;
         let (root, path) = self.resolve(root, path);
         let pos = self.cur_pos;
-        self.muts.push(Mutation { via, root, path, deep, pos, line });
+        let sid = self.cur_stmt;
+        self.muts.push(Mutation { via, root, path, deep, pos, line, sid });
     }
 
     fn resolve(&self, root: VarId, path: Path) -> (VarId, Path) {
@@ -598,11 +661,20 @@ impl<'a> Fn<'a> {
                 self.iter(it);
                 return;
             }
+            ExprKind::IsInst(x, d, Some(v)) if !self.p.classes[*d].subs.is_empty() => {
+                // narrowed to a class with subclasses: a copy of the value
+                if let Some((r, p)) = self.place(x) {
+                    let (r, p) = self.resolve(r, p);
+                    self.pending.push((r, p, Some(*v), self.cur_pos, e.line));
+                }
+            }
+            ExprKind::IsSome(x, _, Some(v)) | ExprKind::IsInst(x, _, Some(v)) => self.bind_narrow(*v, x),
+            ExprKind::SomeOf(x) => self.owned(x, Dest::Escape, e.line),
             _ => {}
         }
         e.children(&mut |c| self.expr(c));
         match &e.kind {
-            ExprKind::Call(fid, args) => self.call(*fid, None, args, e),
+            ExprKind::Call(fid, args) | ExprKind::SuperInit(fid, args) => self.call(*fid, None, args, e),
             ExprKind::Method(r, fid, args) => self.call(*fid, Some(r), args, e),
             ExprKind::New(c, args) => {
                 if let Some(init) = self.p.classes[*c].init {
@@ -699,6 +771,11 @@ impl<'a> Fn<'a> {
         for (i, a) in args.iter().enumerate() {
             match self.o.params[fid][i] {
                 Mode::Mut => {
+                    if matches!(a.kind, ExprKind::Upcast(_)) {
+                        self.errors.push(Error::new(e.line, format!(
+                            "{}() modifies this argument, which is a subclass value passed as its base class",
+                            callee.name)).hint("store it in a variable typed as the base class first"));
+                    }
                     if let Some((root, p)) = self.place(a) {
                         let (rr, _) = self.resolve(root, vec![]);
                         mut_roots.push(rr);
@@ -756,6 +833,10 @@ impl<'a> Fn<'a> {
             self.owned(b, dest, line);
             return;
         }
+        if let ExprKind::Upcast(x) = &e.kind {
+            self.owned(x, dest, line);
+            return;
+        }
         // a whole variable that dies here is moved
         if let ExprKind::Var(v) = &e.kind {
             let var = &self.f.vars[*v];
@@ -766,7 +847,7 @@ impl<'a> Fn<'a> {
                     self.o.params[self.fid][i] == Mode::Owned
                 }
                 VarKind::Bound => !self.origin.contains_key(v),
-                VarKind::SelfParam => false,
+                VarKind::SelfParam | VarKind::Narrow => false,
             };
             if matches!(var.kind, VarKind::Param | VarKind::SelfParam) && matches!(dest, Dest::Escape | Dest::Return) {
                 self.escaped.insert(*v);
@@ -792,6 +873,19 @@ impl<'a> Fn<'a> {
             }
         }
         if self.imm(&e.ty) {
+            return;
+        }
+        // `node.next = self.head; self.head = node`: the old value moves
+        if matches!(e.kind, ExprKind::Field(..) | ExprKind::Var(_))
+            && matches!(e.ty, Ty::Optional(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Str)
+            && self.in_closure == 0
+            && self.overwritten_next(e)
+        {
+            self.takes.insert(e.id);
+            if let Some((r, mut p)) = self.place(e) {
+                p.pop();
+                self.mutate(r, p, false, line);
+            }
             return;
         }
         let sources = self.sources(e);
@@ -822,6 +916,106 @@ impl<'a> Fn<'a> {
                 );
             }
         }
+    }
+
+    /// Is place `e` assigned again by a later statement of the same block before
+    /// anything else reads it (and not used again in this statement)?
+    fn overwritten_next(&self, e: &Expr) -> bool {
+        let Some((root, path)) = self.place(e) else { return false };
+        if self.f.vars[root].kind == VarKind::Bound || path.is_empty() && self.f.vars[root].kind != VarKind::SelfParam && self.f.vars[root].kind != VarKind::Param {
+            return false;
+        }
+        let Some(cur) = self.find_stmt(self.cur_stmt) else { return false };
+        // the place occurs once in this statement
+        let mut n = 0;
+        let count = |x: &Expr, n: &mut i32| {
+            fn go(x: &Expr, root: VarId, path: &Path, f: &Fn, n: &mut i32) {
+                if let Some((r, p)) = f.place(x) {
+                    if r == root && (prefix(&p, path) || prefix(path, &p)) && matches!(x.kind, ExprKind::Var(_) | ExprKind::Field(..)) && p.len() == path.len() {
+                        *n += 1;
+                        return;
+                    }
+                }
+                x.children(&mut |c| go(c, root, path, f, n));
+            }
+            go(x, root, &path, self, n)
+        };
+        stmt_exprs_all(cur, &mut |x| count(x, &mut n));
+        if n != 1 {
+            return false;
+        }
+        let Some(after) = following(&self.f.body, self.cur_stmt) else { return false };
+        for s in after {
+            if let StmtKind::Assign(Target::Place(pl), v) = &s.kind {
+                if self.place(pl) == Some((root, path.clone())) {
+                    let mut u = vec![];
+                    uses(v, &mut u);
+                    return !u.iter().any(|w| self.resolve(*w, vec![]).0 == root);
+                }
+            }
+            let mut u = vec![];
+            stmt_exprs_all(s, &mut |x| uses(x, &mut u));
+            if u.iter().any(|w| self.resolve(*w, vec![]).0 == root) || !s.blocks().is_empty() {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Locals assigned only from places of `self`, parameters or themselves,
+    /// never modified: they can be references.
+    fn views(&self) -> HashSet<VarId> {
+        let mut assigns: HashMap<VarId, Vec<&Expr>> = HashMap::new();
+        let mut bad: HashSet<VarId> = HashSet::new();
+        fn walk<'b>(s: &'b [Stmt], a: &mut HashMap<VarId, Vec<&'b Expr>>, bad: &mut HashSet<VarId>) {
+            for x in s {
+                match &x.kind {
+                    StmtKind::Assign(Target::Var(w), v) => a.entry(*w).or_default().push(v),
+                    StmtKind::Assign(t, _) => {
+                        let mut vs = vec![];
+                        t.vars(&mut vs);
+                        bad.extend(vs);
+                    }
+                    StmtKind::AugVar(w, ..) => {
+                        bad.insert(*w);
+                    }
+                    _ => {}
+                }
+                for b in x.blocks() {
+                    walk(b, a, bad);
+                }
+            }
+        }
+        walk(&self.f.body, &mut assigns, &mut bad);
+        let mut out = HashSet::new();
+        'var: for (w, vals) in assigns {
+            let var = &self.f.vars[w];
+            if var.kind != VarKind::Local || bad.contains(&w) || !matches!(var.ty, Ty::Optional(_) | Ty::Class(_) | Ty::Dict(..) | Ty::Tuple(_)) || var.ty.is_copy() {
+                continue;
+            }
+            if self.muts.iter().any(|m| m.root == w) {
+                continue;
+            }
+            for v in vals {
+                if !matches!(v.kind, ExprKind::Var(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::TupleField(..)) || self.moves.contains(&v.id) || self.takes.contains(&v.id) {
+                    continue 'var;
+                }
+                let Some((r, p)) = self.place(v) else { continue 'var };
+                let (r, _) = self.resolve(r, p);
+                let ok = r == w || matches!(self.f.vars[r].kind, VarKind::Param | VarKind::SelfParam);
+                if !ok {
+                    continue 'var;
+                }
+                if let VarKind::Param = self.f.vars[r].kind {
+                    let i = self.f.params.iter().position(|q| q.var == r).unwrap();
+                    if self.o.params[self.fid][i] == Mode::Owned {
+                        continue 'var;
+                    }
+                }
+            }
+            out.insert(w);
+        }
+        out
     }
 
     /// Where the value of a non-fresh expression lives.
@@ -897,6 +1091,7 @@ impl<'a> Fn<'a> {
                 out.extend(self.sources(a));
                 out.extend(self.sources(b));
             }
+            ExprKind::Upcast(x) => out.extend(self.sources(x)),
             _ => {}
         }
         out
@@ -917,6 +1112,14 @@ impl<'a> Fn<'a> {
         match it {
             Iter::Gen(e) => self.expr(e),
             _ => it.exprs(&mut |x| self.expr(x)),
+        }
+    }
+
+    /// The value of a narrowed Optional borrows from its place.
+    fn bind_narrow(&mut self, v: VarId, place: &Expr) {
+        if let Some((r, mut p)) = self.place(place) {
+            p.push(Step::Some);
+            self.origin.insert(v, (r, p));
         }
     }
 
@@ -1073,6 +1276,36 @@ impl<'a> Fn<'a> {
                 }
                 out.into_iter().chain(u).collect()
             }
+            StmtKind::LetSome(_, e, body) => {
+                uses(e, &mut u);
+                let lb = self.live_block(body, HashSet::new(), ctx);
+                out.into_iter().chain(u).chain(lb).collect()
+            }
+            StmtKind::Try(b, hs, e, f) => {
+                // any statement of the body may jump to a handler: what the
+                // handlers and `finally` need stays alive through the body
+                let lf = self.live_block(f, out, ctx);
+                let le = self.live_block(e, lf.clone(), ctx);
+                let mut lh: HashSet<VarId> = lf.clone();
+                for h in hs {
+                    lh.extend(self.live_block(&h.body, lf.clone(), ctx));
+                }
+                let lb_out: HashSet<VarId> = le.iter().chain(lh.iter()).copied().collect();
+                let lb = self.live_block(b, lb_out, ctx);
+                fn add(f: &mut Fn, s: &[Stmt], extra: &HashSet<VarId>) {
+                    for x in s {
+                        if let Some(l) = f.live_out.get_mut(&x.id) {
+                            l.extend(extra.iter().copied());
+                        }
+                        for blk in x.blocks() {
+                            add(f, blk, extra);
+                        }
+                    }
+                }
+                add(self, b, &lh);
+                lb.into_iter().chain(lh).collect()
+            }
+            StmtKind::Reraise(_) => HashSet::new(),
             StmtKind::Break => ctx.last().map(|c| c.0.clone()).unwrap_or_default(),
             StmtKind::Continue => ctx.last().map(|c| c.1.clone()).unwrap_or_default(),
             StmtKind::Pass => out,
@@ -1129,13 +1362,10 @@ impl<'a> Fn<'a> {
                 if st.id == id {
                     return Some(st);
                 }
-                match &st.kind {
-                    StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
-                        if let Some(x) = go(a, id).or_else(|| go(b, id)) {
-                            return Some(x);
-                        }
+                for b in st.blocks() {
+                    if let Some(x) = go(b, id) {
+                        return Some(x);
                     }
-                    _ => {}
                 }
             }
             None
@@ -1163,7 +1393,12 @@ impl<'a> Fn<'a> {
                 if !self.after(pos, m.pos) {
                     continue;
                 }
-                let hit_src = m.root == root && (prefix(&path, &m.path) || (m.deep && prefix(&m.path, &path)));
+                // the copy only differs from the original if it is used afterwards
+                let dest_live = match dest {
+                    Some(d) => self.live_out.get(&m.sid).map(|l| l.contains(&d)).unwrap_or(true),
+                    None => true,
+                };
+                let hit_src = m.root == root && (prefix(&path, &m.path) || (m.deep && prefix(&m.path, &path))) && dest_live;
                 let hit_dst = Some(m.root) == dest;
                 if hit_src || hit_dst {
                     let src = &self.f.vars[root].name;
@@ -1234,12 +1469,8 @@ impl<'a> Fn<'a> {
         fn all<'b>(s: &'b [Stmt], f: &Fn, w: &mut dyn FnMut(&Stmt, &Fn)) {
             for st in s {
                 w(st, f);
-                match &st.kind {
-                    StmtKind::If(_, a, b) | StmtKind::While(_, a, b) | StmtKind::For(_, _, a, b) => {
-                        all(a, f, w);
-                        all(b, f, w);
-                    }
-                    _ => {}
+                for b in st.blocks() {
+                    all(b, f, w);
                 }
             }
         }
@@ -1280,12 +1511,54 @@ fn stmt_uses_shallow(s: &Stmt, out: &mut Vec<VarId>) {
             out.push(*v);
             uses(e, out);
         }
-        StmtKind::If(c, ..) | StmtKind::While(c, ..) => uses(c, out),
+        StmtKind::If(c, ..) | StmtKind::While(c, ..) | StmtKind::LetSome(_, c, _) => uses(c, out),
         StmtKind::For(_, it, ..) => it.exprs(&mut |e| uses(e, out)),
         StmtKind::Assert(c, m) => {
             uses(c, out);
             if let Some(m) = m {
                 uses(m, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The statements after `id` in its block.
+fn following(s: &[Stmt], id: u32) -> Option<&[Stmt]> {
+    if let Some(i) = s.iter().position(|x| x.id == id) {
+        return Some(&s[i + 1..]);
+    }
+    for x in s {
+        for b in x.blocks() {
+            if let Some(r) = following(b, id) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// All expressions of a statement (not nested statements), targets included.
+fn stmt_exprs_all(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+    match &s.kind {
+        StmtKind::Expr(e) | StmtKind::Del(e) | StmtKind::Return(Some(e)) | StmtKind::Raise(_, Some(e)) => f(e),
+        StmtKind::Assign(t, e) => {
+            f(e);
+            let mut ps = vec![];
+            collect_places(t, &mut ps);
+            ps.into_iter().for_each(|p| f(p));
+        }
+        StmtKind::AugAssign(t, _, e) => {
+            f(t);
+            f(e)
+        }
+        StmtKind::AugVar(_, _, e) => f(e),
+        StmtKind::If(c, ..) | StmtKind::While(c, ..) | StmtKind::LetSome(_, c, _) => f(c),
+        StmtKind::For(_, it, ..) => it.exprs(f),
+        StmtKind::Assert(c, m) => {
+            f(c);
+            if let Some(m) = m {
+                f(m)
             }
         }
         _ => {}

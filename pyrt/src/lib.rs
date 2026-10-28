@@ -7,10 +7,12 @@ use std::io::{BufRead, Write};
 
 pub use indexmap::{IndexMap, IndexSet};
 
+pub mod err;
 pub mod math;
 pub mod spec;
 pub mod strs;
 
+pub use err::*;
 pub use strs::*;
 
 // ------------------------------------------------------------------ errors
@@ -132,6 +134,30 @@ impl<T: Py + ?Sized> Py for &T {
 }
 
 impl<T: Py + ?Sized> Py for &mut T {
+    fn fmt_repr(&self, out: &mut String) {
+        (**self).fmt_repr(out)
+    }
+    fn fmt_str(&self, out: &mut String) {
+        (**self).fmt_str(out)
+    }
+}
+
+impl<T: Py> Py for Option<T> {
+    fn fmt_repr(&self, out: &mut String) {
+        match self {
+            Some(x) => x.fmt_repr(out),
+            None => out.push_str("None"),
+        }
+    }
+    fn fmt_str(&self, out: &mut String) {
+        match self {
+            Some(x) => x.fmt_str(out),
+            None => out.push_str("None"),
+        }
+    }
+}
+
+impl<T: Py + ?Sized> Py for Box<T> {
     fn fmt_repr(&self, out: &mut String) {
         (**self).fmt_repr(out)
     }

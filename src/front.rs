@@ -34,6 +34,8 @@ pub fn lower(src: &str) -> Res<Program> {
         scopes: Vec::new(),
         active: HashSet::new(),
         loops: 0,
+        narrow: Vec::new(),
+        handlers: Vec::new(),
     };
     f.module(&module.body)?;
     f.finish()?;
@@ -55,13 +57,74 @@ struct Front {
     /// loop / comprehension variables currently bound
     active: HashSet<VarId>,
     loops: u32,
+    /// narrowed Optional places: (root var, fields) → variable holding the value
+    narrow: Vec<((VarId, Vec<String>), VarId)>,
+    /// the exception variables of the enclosing except clauses
+    handlers: Vec<VarId>,
 }
 
-const EXCEPTIONS: &[&str] = &[
+/// Does a block contain return / break / continue (not inside nested loops for the latter)?
+fn leaves(body: &[AStmt]) -> bool {
+    use ruff_python_ast::statement_visitor::{walk_stmt, StatementVisitor};
+    struct V(bool, u32);
+    impl<'x> StatementVisitor<'x> for V {
+        fn visit_stmt(&mut self, s: &'x AStmt) {
+            match s {
+                AStmt::Return(_) => self.0 = true,
+                AStmt::Break(_) | AStmt::Continue(_) if self.1 == 0 => self.0 = true,
+                AStmt::For(_) | AStmt::While(_) => {
+                    self.1 += 1;
+                    walk_stmt(self, s);
+                    self.1 -= 1;
+                }
+                AStmt::FunctionDef(_) | AStmt::ClassDef(_) => {}
+                _ => walk_stmt(self, s),
+            }
+        }
+    }
+    let mut v = V(false, 0);
+    v.visit_body(body);
+    v.0
+}
+
+/// `x` or `x.a.b` as (root variable, field names).
+fn place_key(e: &Expr) -> Option<(VarId, Vec<String>)> {
+    match &e.kind {
+        ExprKind::Var(v) => Some((*v, vec![])),
+        ExprKind::Field(b, f) => {
+            let (r, mut p) = place_key(b)?;
+            p.push(f.clone());
+            Some((r, p))
+        }
+        _ => None,
+    }
+}
+
+pub const EXCEPTIONS: &[&str] = &[
     "Exception", "ValueError", "TypeError", "IndexError", "KeyError", "RuntimeError",
     "ZeroDivisionError", "AssertionError", "NotImplementedError", "ArithmeticError",
-    "OverflowError", "LookupError", "StopIteration", "AttributeError",
+    "OverflowError", "LookupError", "StopIteration", "AttributeError", "EOFError", "BaseException",
 ];
+
+/// Names `m` of `super().m(...)` calls.
+fn super_calls(body: &[AStmt], out: &mut Vec<String>) {
+    use ruff_python_ast::visitor::{self, Visitor};
+    struct V<'b>(&'b mut Vec<String>);
+    impl<'x> Visitor<'x> for V<'_> {
+        fn visit_expr(&mut self, e: &'x AExpr) {
+            if let AExpr::Attribute(a) = e {
+                if let AExpr::Call(c) = &*a.value {
+                    if matches!(&*c.func, AExpr::Name(n) if n.id.as_str() == "super") && !self.0.contains(&a.attr.id.to_string()) {
+                        self.0.push(a.attr.id.to_string());
+                    }
+                }
+            }
+            visitor::walk_expr(self, e);
+        }
+    }
+    let mut v = V(out);
+    v.visit_body(body);
+}
 
 fn is_docstring(s: &AStmt) -> bool {
     matches!(s, AStmt::Expr(e) if matches!(*e.value, AExpr::StringLiteral(_)))
@@ -107,6 +170,15 @@ fn assigned_names(body: &[AStmt], out: &mut HashMap<String, usize>) {
                     assigned_names(&c.body, out);
                 }
             }
+            AStmt::Try(t) => {
+                assigned_names(&t.body, out);
+                for h in &t.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = h;
+                    assigned_names(&h.body, out);
+                }
+                assigned_names(&t.orelse, out);
+                assigned_names(&t.finalbody, out);
+            }
             _ => {}
         }
     }
@@ -114,7 +186,7 @@ fn assigned_names(body: &[AStmt], out: &mut HashMap<String, usize>) {
 
 fn is_const_expr(e: &AExpr, consts: &HashMap<String, usize>) -> bool {
     match e {
-        AExpr::NumberLiteral(_) | AExpr::StringLiteral(_) | AExpr::BooleanLiteral(_) => true,
+        AExpr::NumberLiteral(_) | AExpr::StringLiteral(_) | AExpr::BooleanLiteral(_) | AExpr::NoneLiteral(_) => true,
         AExpr::UnaryOp(u) => is_const_expr(&u.operand, consts),
         AExpr::BinOp(b) => is_const_expr(&b.left, consts) && is_const_expr(&b.right, consts),
         AExpr::Name(n) => consts.contains_key(n.id.as_str()),
@@ -156,6 +228,7 @@ impl Front {
             Ty::Set(a) => Ty::set(self.norm(a)),
             Ty::Dict(k, v) => Ty::dict(self.norm(k), self.norm(v)),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.norm(t)).collect()),
+            Ty::Optional(a) => Ty::opt(self.norm(a)),
             _ => t.clone(),
         }
     }
@@ -172,7 +245,7 @@ impl Front {
                 self.tvars[*y] = Some(a.clone());
                 true
             }
-            (Ty::List(x), Ty::List(y)) | (Ty::Set(x), Ty::Set(y)) => self.unify(x, y),
+            (Ty::List(x), Ty::List(y)) | (Ty::Set(x), Ty::Set(y)) | (Ty::Optional(x), Ty::Optional(y)) => self.unify(x, y),
             (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
             (Ty::Tuple(x), Ty::Tuple(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| self.unify(p, q))
@@ -194,6 +267,19 @@ impl Front {
         }
         if self.unify(&have, &w) {
             return Ok(e);
+        }
+        // subclass → base class
+        if let (Ty::Class(x) | Ty::Obj(x), Ty::Class(a)) = (&have, &w) {
+            if self.p.is_sub(*x, *a) {
+                let line = e.line;
+                return Ok(self.mk(line, w.clone(), ExprKind::Upcast(Box::new(e))));
+            }
+        }
+        // T → T | None
+        if let (Ty::Optional(inner), false) = (&w, matches!(have, Ty::Optional(_) | Ty::Var(_))) {
+            let line = e.line;
+            let x = self.coerce(e, inner, what)?;
+            return Ok(self.mk(line, w.clone(), ExprKind::SomeOf(Box::new(x))));
         }
         err(e.line, format!("{} must be {}, not {}", what, self.tn(&w), self.tn(&have)))
     }
@@ -239,7 +325,8 @@ impl Front {
                 AStmt::Assign(a)
                     if a.targets.len() == 1
                         && matches!(&a.targets[0], AExpr::Name(n) if counts.get(n.id.as_str()) == Some(&1))
-                        && is_const_expr(&a.value, &self.consts) =>
+                        && is_const_expr(&a.value, &self.consts)
+                        && !matches!(*a.value, AExpr::NoneLiteral(_)) =>
                 {
                     let AExpr::Name(n) = &a.targets[0] else { unreachable!() };
                     self.consts.insert(n.id.to_string(), const_defs.len());
@@ -247,6 +334,7 @@ impl Front {
                 }
                 AStmt::AnnAssign(a)
                     if a.value.is_some()
+                        && matches!(&*a.annotation, AExpr::Name(t) if ["int", "float", "bool", "str"].contains(&t.id.as_str()))
                         && matches!(&*a.target, AExpr::Name(n) if counts.get(n.id.as_str()) == Some(&1))
                         && is_const_expr(a.value.as_ref().unwrap(), &self.consts) =>
                 {
@@ -276,7 +364,36 @@ impl Front {
                 frozen: false,
                 init: None,
                 methods: vec![],
+                base: None,
+                subs: vec![],
+                dispatch: vec![],
+                exc: None,
             });
+        }
+        for d in &cdefs {
+            let cid = self.classes[d.name.id.as_str()];
+            let line = self.line(*d);
+            let Some(args) = &d.arguments else { continue };
+            if !args.keywords.is_empty() || args.args.len() > 1 {
+                return err(line, "only single inheritance is supported");
+            }
+            let Some(b) = args.args.first() else { continue };
+            let AExpr::Name(n) = b else { return err(line, "unsupported base class") };
+            let b = n.id.as_str();
+            if b == "object" {
+                continue;
+            }
+            if EXCEPTIONS.contains(&b) {
+                self.p.classes[cid].exc = Some(b.to_string());
+                continue;
+            }
+            let Some(&bc) = self.classes.get(b) else { return err(line, format!("unknown base class `{}`", b)) };
+            if bc >= cid {
+                return err(line, format!("define `{}` before its subclasses", b));
+            }
+            self.p.classes[cid].base = Some(bc);
+            self.p.classes[cid].exc = self.p.classes[bc].exc.clone();
+            self.p.classes[bc].subs.push(cid);
         }
         // `main` holds module-level code; constants are lowered in its context
         self.p.main = self.new_func("main", 0, None);
@@ -303,13 +420,27 @@ impl Front {
             self.funcs.insert(d.name.id.to_string(), id);
         }
         let mut bodies: Vec<(FuncId, &ast::StmtFunctionDef)> = Vec::new();
+        let mut asts: HashMap<ClassId, Vec<(String, &ast::StmtFunctionDef)>> = HashMap::new();
         for d in &cdefs {
-            self.class_sig(d, &mut bodies)?;
+            self.class_sig(d, &mut bodies, &mut asts)?;
         }
-        // __init__ first: it defines the fields of plain classes
-        for &(fid, d) in &bodies {
-            if self.p.funcs[fid].is_init {
-                self.body(fid, &d.body)?;
+        self.dispatchers()?;
+        // classes in order: inherited fields, then __init__ (it defines fields)
+        for d in &cdefs {
+            let cid = self.classes[d.name.id.as_str()];
+            if let Some(b) = self.p.classes[cid].base {
+                let mut fs = self.p.classes[b].fields.clone();
+                for f in std::mem::take(&mut self.p.classes[cid].fields) {
+                    if fs.iter().any(|g| g.name == f.name) {
+                        return err(self.line(*d), format!("field `{}` is already defined in a base class", f.name));
+                    }
+                    fs.push(f);
+                }
+                self.p.classes[cid].fields = fs;
+            }
+            if let Some(init) = self.p.classes[cid].init {
+                let ast = bodies.iter().find(|(f, _)| *f == init).unwrap().1;
+                self.body(init, &ast.body)?;
             }
         }
         for &(fid, d) in &bodies {
@@ -344,6 +475,7 @@ impl Front {
             is_init: false,
             is_static: false,
             shadows: vec![],
+            dispatch: vec![],
         });
         self.p.funcs.len() - 1
     }
@@ -359,6 +491,8 @@ impl Front {
         self.scopes = vec![scope];
         self.active.clear();
         self.loops = 0;
+        self.narrow.clear();
+        self.handlers.clear();
     }
 
     fn new_var(&mut self, name: &str, ty: Ty, kind: VarKind) -> VarId {
@@ -409,7 +543,9 @@ impl Front {
                 if name != "self" {
                     return err(line, "the first parameter of a method must be `self`");
                 }
-                let v = self.new_var("self", Ty::Class(class.unwrap()), VarKind::SelfParam);
+                let c = class.unwrap();
+                let st = if self.p.classes[c].subs.is_empty() { Ty::Class(c) } else { Ty::Obj(c) };
+                let v = self.new_var("self", st, VarKind::SelfParam);
                 self.p.funcs[fid].self_var = Some(v);
                 continue;
             }
@@ -448,13 +584,14 @@ impl Front {
         &mut self,
         d: &'a ast::StmtClassDef,
         bodies: &mut Vec<(FuncId, &'a ast::StmtFunctionDef)>,
+        asts: &mut HashMap<ClassId, Vec<(String, &'a ast::StmtFunctionDef)>>,
     ) -> Res<()> {
         let cid = self.classes[d.name.id.as_str()];
-        let line = self.line(d);
-        if let Some(args) = &d.arguments {
-            if !args.args.is_empty() || !args.keywords.is_empty() {
-                return err(line, "class inheritance is not supported yet");
+        if self.p.classes[cid].exc.is_some() {
+            if d.body.iter().all(|s| matches!(s, AStmt::Pass(_)) || is_docstring(s)) {
+                return Ok(());
             }
+            return err(self.line(d), "exception classes can only contain `pass` for now");
         }
         for dec in &d.decorator_list {
             let (name, kws) = match &dec.expression {
@@ -526,6 +663,107 @@ impl Front {
                 _ => return err(self.line(s), "unsupported statement in class body"),
             }
         }
+        // methods of the base class, compiled again for this class (so that
+        // `self.m()` calls this class's version)
+        let mut map: Vec<(String, &'a ast::StmtFunctionDef)> = match self.p.classes[cid].base {
+            Some(b) => asts.get(&b).cloned().unwrap_or_default(),
+            None => vec![],
+        };
+        let own: Vec<(String, &'a ast::StmtFunctionDef)> = d
+            .body
+            .iter()
+            .filter_map(|s| if let AStmt::FunctionDef(f) = s { Some((f.name.id.to_string(), f)) } else { None })
+            .collect();
+        if let Some(b) = self.p.classes[cid].base {
+            for (name, f) in &map {
+                if own.iter().any(|(n, _)| n == name) {
+                    continue;
+                }
+                if name == "__init__" && self.p.classes[cid].dataclass {
+                    return err(self.line(d), "a dataclass cannot inherit an __init__");
+                }
+                let fid = self.signature(f, Some(cid))?;
+                if name == "__init__" {
+                    self.p.funcs[fid].is_init = true;
+                    self.p.classes[cid].init = Some(fid);
+                }
+                self.p.classes[cid].methods.push((name.clone(), fid));
+                bodies.push((fid, f));
+            }
+            // `super().m(...)`: the base's m, compiled for this class
+            let mut used = vec![];
+            for (_, f) in &own {
+                super_calls(&f.body, &mut used);
+            }
+            for m in used {
+                if m == "__init__" || self.p.classes[cid].method(&format!("super_{}", m)).is_some() {
+                    continue;
+                }
+                let Some((_, bf)) = map.iter().find(|(n, _)| *n == m) else {
+                    return err(self.line(d), format!("`{}` has no method `{}`", self.p.classes[b].name, m));
+                };
+                let fid = self.signature(bf, Some(cid))?;
+                let name = format!("super_{}", m);
+                self.p.funcs[fid].name = name.clone();
+                self.p.classes[cid].methods.push((name, fid));
+                bodies.push((fid, bf));
+            }
+        }
+        for (n, f) in own {
+            map.retain(|(m, _)| *m != n);
+            map.push((n, f));
+        }
+        asts.insert(cid, map);
+        Ok(())
+    }
+
+    /// For each class with subclasses, one method per name that calls the
+    /// implementation of the actual class.
+    fn dispatchers(&mut self) -> Res<()> {
+        for c in 0..self.p.classes.len() {
+            if self.p.classes[c].subs.is_empty() || self.p.classes[c].exc.is_some() {
+                continue;
+            }
+            let methods = self.p.classes[c].methods.clone();
+            for (name, fid) in methods {
+                if name == "__init__" || name.starts_with("super_") || self.p.funcs[fid].is_static {
+                    continue;
+                }
+                let proto = self.p.funcs[fid].clone();
+                let sig = |f: &Func| -> (Vec<Ty>, Ty) {
+                    (f.params.iter().map(|q| f.vars[q.var].ty.clone()).collect(), f.ret.clone())
+                };
+                let want = sig(&proto);
+                let mut impls = vec![];
+                for x in self.p.subtree(c) {
+                    let Some(xf) = self.p.classes[x].method(&name) else { continue };
+                    if sig(&self.p.funcs[xf]) != want {
+                        return err(self.p.funcs[xf].line, format!(
+                            "{}.{} must take and return the same types as in {}",
+                            self.p.classes[x].name, name, self.p.classes[c].name));
+                    }
+                    impls.push((x, xf));
+                }
+                let mut f = proto;
+                f.body = vec![];
+                f.dispatch = impls;
+                let mut vars = vec![];
+                let mut params = vec![];
+                let orig = self.p.funcs[fid].clone();
+                let sv = Var { name: "self".into(), ty: Ty::Class(c), kind: VarKind::SelfParam };
+                vars.push(sv);
+                for q in &orig.params {
+                    vars.push(orig.vars[q.var].clone());
+                    params.push(Param { var: vars.len() - 1, default: q.default.clone() });
+                }
+                f.vars = vars;
+                f.params = params;
+                f.self_var = Some(0);
+                let d = self.p.funcs.len();
+                self.p.funcs.push(f);
+                self.p.classes[c].dispatch.push((name, d));
+            }
+        }
         Ok(())
     }
 
@@ -587,25 +825,160 @@ impl Front {
                         }
                         Ok(Ty::Tuple(args.iter().map(|a| self.ann(a)).collect::<Res<_>>()?))
                     }
-                    ("Optional", _) => err(line, "Optional types are not supported yet"),
+                    ("Optional", 1) => self.optional(args[0], line),
+                    ("Union", 2) => {
+                        let (a, b) = (args[0], args[1]);
+                        if matches!(b, AExpr::NoneLiteral(_)) {
+                            self.optional(a, line)
+                        } else if matches!(a, AExpr::NoneLiteral(_)) {
+                            self.optional(b, line)
+                        } else {
+                            err(line, "union types other than `X | None` are not supported")
+                        }
+                    }
                     _ => err(line, "unsupported type annotation"),
                 }
             }
             AExpr::BinOp(b) if b.op == ast::Operator::BitOr => {
-                err(line, "union types (`X | Y`, Optional) are not supported yet")
+                if matches!(*b.right, AExpr::NoneLiteral(_)) {
+                    self.optional(&b.left, line)
+                } else if matches!(*b.left, AExpr::NoneLiteral(_)) {
+                    self.optional(&b.right, line)
+                } else {
+                    err(line, "union types other than `X | None` are not supported")
+                }
             }
             _ => err(line, "unsupported type annotation"),
         }
+    }
+
+    fn optional(&mut self, a: &AExpr, line: u32) -> Res<Ty> {
+        let t = self.ann(a)?;
+        if matches!(t, Ty::Optional(_) | Ty::None) {
+            return err(line, "nested Optional types are not supported");
+        }
+        Ok(Ty::opt(t))
     }
 
     // ------------------------------------------------------------- statements
 
     fn block(&mut self, body: &[AStmt]) -> Res<Vec<Stmt>> {
         let mut out = Vec::new();
+        let depth = self.narrow.len();
         for s in body {
             self.stmt(s, &mut out)?;
         }
+        self.narrow.truncate(depth);
         Ok(out)
+    }
+
+    /// `P is not None` (true) / `P is None` (false) for a place P, and the rest
+    /// of an `and` chain.
+    fn narrowing<'a>(&mut self, test: &'a AExpr) -> Option<(&'a AExpr, bool, Vec<&'a AExpr>, Option<ClassId>)> {
+        fn is_place(e: &AExpr) -> bool {
+            match e {
+                AExpr::Name(_) => true,
+                AExpr::Attribute(a) => is_place(&a.value),
+                _ => false,
+            }
+        }
+        match test {
+            AExpr::Compare(c) if c.ops.len() == 1 && matches!(c.operands[1], AExpr::NoneLiteral(_)) && is_place(&c.operands[0]) => {
+                match c.ops[0] {
+                    ast::CmpOp::IsNot | ast::CmpOp::NotEq => Some((&c.operands[0], true, vec![], None)),
+                    ast::CmpOp::Is | ast::CmpOp::Eq => Some((&c.operands[0], false, vec![], None)),
+                    _ => None,
+                }
+            }
+            AExpr::Call(c) if matches!(&*c.func, AExpr::Name(n) if n.id.as_str() == "isinstance" && self.lookup("isinstance").is_none())
+                && c.arguments.args.len() == 2 && is_place(&c.arguments.args[0]) =>
+            {
+                let d = self.class_arg(&c.arguments.args[1], 0).ok()?;
+                Some((&c.arguments.args[0], true, vec![], Some(d)))
+            }
+            AExpr::UnaryOp(u) if u.op == ast::UnaryOp::Not && matches!(&*u.operand, AExpr::Call(_)) => {
+                let (p, pos, rest, d) = self.narrowing(&u.operand)?;
+                if !pos || !rest.is_empty() || d.is_none() {
+                    return None;
+                }
+                Some((p, false, rest, d))
+            }
+            AExpr::Name(_) | AExpr::Attribute(_) if is_place(test) => {
+                let e = self.expr(test, None).ok()?;
+                match self.norm(&e.ty) {
+                    Ty::Optional(t) if matches!(*t, Ty::Class(_)) => Some((test, true, vec![], None)),
+                    _ => None,
+                }
+            }
+            AExpr::UnaryOp(u) if u.op == ast::UnaryOp::Not && is_place(&u.operand) => {
+                let e = self.expr(&u.operand, None).ok()?;
+                match self.norm(&e.ty) {
+                    Ty::Optional(t) if matches!(*t, Ty::Class(_)) => Some((&u.operand, false, vec![], None)),
+                    _ => None,
+                }
+            }
+            AExpr::BoolOp(b) if b.op == ast::BoolOp::And => {
+                let (p, pos, _, d) = self.narrowing(&b.values[0])?;
+                if !pos {
+                    return None;
+                }
+                Some((p, true, b.values[1..].iter().collect(), d))
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower the place of a narrowing and create the variable for its value.
+    fn narrow_var(&mut self, place: &AExpr, cls: Option<ClassId>) -> Res<Option<(Expr, VarId)>> {
+        let pe = self.expr(place, None)?;
+        let inner = match cls {
+            None => {
+                let Ty::Optional(inner) = self.norm(&pe.ty) else {
+                    return err(pe.line, format!("this is {}, never None", self.tn(&pe.ty)));
+                };
+                inner
+            }
+            Some(d) => {
+                // only a value that may be several classes, narrowed to one without subclasses
+                let Ty::Class(c) = self.norm(&pe.ty) else { return Ok(None) };
+                if self.p.classes[c].subs.is_empty() || d == c || !self.p.is_sub(d, c) {
+                    return Ok(None);
+                }
+                Box::new(Ty::Class(d))
+            }
+        };
+        let Some(key) = place_key(&pe) else { return Ok(None) };
+        let name = match place {
+            AExpr::Name(n) => n.id.to_string(),
+            AExpr::Attribute(a) => {
+                let n = a.attr.id.to_string();
+                if self.lookup(&n).is_some() { format!("{}_", n) } else { n }
+            }
+            _ => unreachable!(),
+        };
+        let vars = &mut self.p.funcs[self.cur].vars;
+        vars.push(Var { name, ty: *inner, kind: VarKind::Narrow });
+        let v = vars.len() - 1;
+        let _ = key;
+        Ok(Some((pe, v)))
+    }
+
+    fn push_narrow(&mut self, pe: &Expr, v: VarId) {
+        if let Some(k) = place_key(pe) {
+            self.narrow.push((k, v));
+        }
+    }
+
+    /// An assignment to a place ends the narrowings of it and below it.
+    fn unnarrow(&mut self, t: &Expr) {
+        if let Some((r, path)) = place_key(t) {
+            self.narrow.retain(|((r2, p2), _)| !(*r2 == r && p2.len() >= path.len() && p2[..path.len()] == path[..]));
+        }
+    }
+
+    fn narrowed(&self, e: &Expr) -> Option<VarId> {
+        let k = place_key(e)?;
+        self.narrow.iter().rev().find(|(k2, _)| *k2 == k).map(|(_, v)| *v)
     }
 
     fn stmt(&mut self, s: &AStmt, out: &mut Vec<Stmt>) -> Res<()> {
@@ -631,6 +1004,10 @@ impl Front {
                 }
                 match &r.value {
                     None if ret == Ty::None => StmtKind::Return(None),
+                    None if matches!(ret, Ty::Optional(_)) => {
+                        let n = self.mk(line, ret.clone(), ExprKind::NoneVal);
+                        StmtKind::Return(Some(n))
+                    }
                     None => return err(line, format!("missing return value ({})", self.tn(&ret))),
                     Some(v) => {
                         if ret == Ty::None {
@@ -643,32 +1020,25 @@ impl Front {
                 }
             }
             AStmt::If(i) => {
-                let cond = self.cond(&i.test)?;
-                let then = self.block(&i.body)?;
-                let mut els = Vec::new();
-                // elif chain → nested ifs
-                let mut chain: Vec<(Option<Expr>, Vec<Stmt>, u32)> = Vec::new();
-                for c in &i.elif_else_clauses {
-                    let t = match &c.test {
-                        Some(t) => Some(self.cond(t)?),
-                        None => None,
-                    };
-                    let b = self.block(&c.body)?;
-                    chain.push((t, b, self.line(c)));
+                let st = self.lower_if(&i.test, &i.body, &i.elif_else_clauses, line, true, out)?;
+                if let Some(st) = st {
+                    out.push(st);
                 }
-                for (t, b, l) in chain.into_iter().rev() {
-                    els = match t {
-                        None => b,
-                        Some(t) => vec![self.stmt_(l, StmtKind::If(t, b, els))],
-                    };
-                }
-                StmtKind::If(cond, then, els)
+                return Ok(());
             }
             AStmt::While(w) => {
-                let cond = self.cond(&w.test)?;
+                let depth = self.narrow.len();
+                let cond = match self.narrowing(&w.test) {
+                    Some((place, true, rest, cls)) => match self.narrow_var(place, cls)? {
+                        Some((pe, v)) => self.narrow_cond(pe, v, &rest, line)?,
+                        None => self.cond(&w.test)?,
+                    },
+                    _ => self.cond(&w.test)?,
+                };
                 self.loops += 1;
                 let body = self.block(&w.body)?;
                 self.loops -= 1;
+                self.narrow.truncate(depth);
                 let orelse = self.block(&w.orelse)?;
                 StmtKind::While(cond, body, orelse)
             }
@@ -722,7 +1092,15 @@ impl Front {
                 if r.cause.is_some() {
                     return err(line, "`raise ... from` is not supported");
                 }
-                let Some(exc) = &r.exc else { return err(line, "bare `raise` is not supported") };
+                let Some(exc) = &r.exc else {
+                    return match self.handlers.last() {
+                        Some(v) => {
+                            out.push(self.stmt_(line, StmtKind::Reraise(*v)));
+                            Ok(())
+                        }
+                        None => err(line, "bare `raise` outside an except clause"),
+                    };
+                };
                 let (name, arg) = match &**exc {
                     AExpr::Name(n) => (n.id.to_string(), None),
                     AExpr::Call(c) => match &*c.func {
@@ -733,7 +1111,7 @@ impl Front {
                     },
                     _ => return err(line, "unsupported raise"),
                 };
-                if !EXCEPTIONS.contains(&name.as_str()) {
+                if !self.is_exception(&name) {
                     return err(line, format!("unknown exception `{}`", name));
                 }
                 let msg = match arg {
@@ -746,6 +1124,16 @@ impl Front {
                 StmtKind::Raise(name, msg)
             }
             AStmt::Assert(a) => {
+                if let Some((place, true, rest, None)) = self.narrowing(&a.test) {
+                    if rest.is_empty() && a.msg.is_none() {
+                        if let Some((pe, v)) = self.narrow_var(place, None)? {
+                            let raise = self.stmt_(line, StmtKind::Raise("AssertionError".into(), None));
+                            self.push_narrow(&pe, v);
+                            out.push(self.stmt_(line, StmtKind::LetSome(v, pe, vec![raise])));
+                            return Ok(());
+                        }
+                    }
+                }
                 let c = self.cond(&a.test)?;
                 let m = match &a.msg {
                     Some(m) => {
@@ -778,7 +1166,66 @@ impl Front {
             }
             AStmt::FunctionDef(_) => return err(line, "nested functions are not supported yet"),
             AStmt::ClassDef(_) => return err(line, "classes must be defined at module level"),
-            AStmt::Try(_) => return err(line, "try/except is not supported yet"),
+            AStmt::Try(t) => {
+                if t.is_star {
+                    return err(line, "`except*` is not supported");
+                }
+                if !t.finalbody.is_empty() {
+                    let mut bad = false;
+                    for b in [&t.body[..], &t.orelse[..]].into_iter().chain(t.handlers.iter().map(|h| {
+                        let ast::ExceptHandler::ExceptHandler(h) = h;
+                        &h.body[..]
+                    })) {
+                        bad |= leaves(b);
+                    }
+                    if bad {
+                        return err(line, "return / break / continue inside try ... finally is not supported yet");
+                    }
+                }
+                let body = self.block(&t.body)?;
+                let mut hs = vec![];
+                for h in &t.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = h;
+                    let hl = self.line(h);
+                    let kinds = match &h.type_ {
+                        None => vec!["BaseException".to_string()],
+                        Some(e) => {
+                            let names: Vec<&AExpr> = match &**e {
+                                AExpr::Tuple(t) => t.elts.iter().collect(),
+                                x => vec![x],
+                            };
+                            let mut ks = vec![];
+                            for n in names {
+                                let AExpr::Name(n) = n else { return err(hl, "except needs exception class names") };
+                                if !self.is_exception(n.id.as_str()) {
+                                    return err(hl, format!("unknown exception `{}`", n.id));
+                                }
+                                ks.push(n.id.to_string());
+                            }
+                            ks
+                        }
+                    };
+                    self.scopes.push(HashMap::new());
+                    let name = h.name.as_ref().map(|n| n.id.to_string()).unwrap_or_else(|| "err".into());
+                    let v = if h.name.is_some() {
+                        self.new_var(&name, Ty::Exc, VarKind::Bound)
+                    } else {
+                        let vars = &mut self.p.funcs[self.cur].vars;
+                        vars.push(Var { name, ty: Ty::Exc, kind: VarKind::Bound });
+                        vars.len() - 1
+                    };
+                    self.active.insert(v);
+                    self.handlers.push(v);
+                    let b = self.block(&h.body)?;
+                    self.handlers.pop();
+                    self.active.remove(&v);
+                    self.scopes.pop();
+                    hs.push(Handler { kinds, var: v, body: b });
+                }
+                let orelse = self.block(&t.orelse)?;
+                let fin = self.block(&t.finalbody)?;
+                StmtKind::Try(body, hs, orelse, fin)
+            }
             AStmt::With(_) => return err(line, "`with` is not supported yet"),
             AStmt::Match(_) => return err(line, "`match` is not supported yet"),
             AStmt::Import(_) | AStmt::ImportFrom(_) => return err(line, "imports must be at module level"),
@@ -786,6 +1233,85 @@ impl Front {
         };
         out.push(self.stmt_(line, kind));
         Ok(())
+    }
+
+    /// `IsSome(P) and rest...` with the narrowing active from here on.
+    fn narrow_cond(&mut self, pe: Expr, v: VarId, rest: &[&AExpr], line: u32) -> Res<Expr> {
+        self.push_narrow(&pe, v);
+        let is = match (self.norm(&pe.ty), self.var(v).ty.clone()) {
+            (Ty::Class(_), Ty::Class(d)) => self.mk(line, Ty::Bool, ExprKind::IsInst(Box::new(pe), d, Some(v))),
+            _ => self.mk(line, Ty::Bool, ExprKind::IsSome(Box::new(pe), true, Some(v))),
+        };
+        if rest.is_empty() {
+            return Ok(is);
+        }
+        let mut vs = vec![is];
+        for r in rest {
+            let x = self.cond(r)?;
+            vs.push(x);
+        }
+        Ok(self.mk(line, Ty::Bool, ExprKind::And(vs)))
+    }
+
+    /// `if` / `elif` / `else`; every test may narrow. With `top`, a diverging
+    /// `if x is None:` without else becomes a let-else (pushed to `out`).
+    fn lower_if(
+        &mut self,
+        test: &AExpr,
+        body: &[AStmt],
+        clauses: &[ast::ElifElseClause],
+        line: u32,
+        top: bool,
+        out: &mut Vec<Stmt>,
+    ) -> Res<Option<Stmt>> {
+        let depth = self.narrow.len();
+        if let Some((place, pos, rest, cls)) = self.narrowing(test) {
+            if let Some((pe, v)) = self.narrow_var(place, cls)? {
+                if pos {
+                    let cond = self.narrow_cond(pe, v, &rest, line)?;
+                    let then = self.block(body)?;
+                    self.narrow.truncate(depth);
+                    let els = self.lower_clauses(clauses)?;
+                    return Ok(Some(self.stmt_(line, StmtKind::If(cond, then, els))));
+                }
+                let diverges = matches!(
+                    body.last(),
+                    Some(AStmt::Return(_) | AStmt::Raise(_) | AStmt::Break(_) | AStmt::Continue(_))
+                );
+                if top && clauses.is_empty() && diverges && cls.is_none() {
+                    // `if x is None: return` → let-else, x narrowed for the rest of the block
+                    let b = self.block(body)?;
+                    self.push_narrow(&pe, v);
+                    out.push(self.stmt_(line, StmtKind::LetSome(v, pe, b)));
+                    return Ok(None);
+                }
+                // `if x is None: A else: B` → `if let Some(x) = .. { B } else { A }`
+                let then = self.block(body)?;
+                let cond = self.narrow_cond(pe, v, &[], line)?;
+                let els = self.lower_clauses(clauses)?;
+                self.narrow.truncate(depth);
+                return Ok(Some(self.stmt_(line, StmtKind::If(cond, els, then))));
+            }
+        }
+        let cond = self.cond(test)?;
+        let then = self.block(body)?;
+        let els = self.lower_clauses(clauses)?;
+        Ok(Some(self.stmt_(line, StmtKind::If(cond, then, els))))
+    }
+
+    fn lower_clauses(&mut self, clauses: &[ast::ElifElseClause]) -> Res<Vec<Stmt>> {
+        match clauses.first() {
+            None => Ok(vec![]),
+            Some(c) => match &c.test {
+                None => self.block(&c.body),
+                Some(t) => {
+                    let line = self.line(c);
+                    let mut dummy = vec![];
+                    let st = self.lower_if(t, &c.body, &clauses[1..], line, false, &mut dummy)?;
+                    Ok(st.into_iter().collect())
+                }
+            },
+        }
     }
 
     fn stmt_(&mut self, line: u32, kind: StmtKind) -> Stmt {
@@ -878,6 +1404,8 @@ impl Front {
                             return err(line, "cannot assign to `self`");
                         }
                         let vt = self.var(v).ty.clone();
+                        let place = self.mk(line, vt.clone(), ExprKind::Var(v));
+                        self.unnarrow(&place);
                         let e = std::mem::replace(val, self.mk(line, Ty::None, ExprKind::NoneLit));
                         *val = self.coerce(e, &vt, &format!("`{}`", name)).map_err(|e| {
                             e.hint(format!("`{}` was declared as {}; a variable keeps one type", name, self.tn(&vt)))
@@ -943,7 +1471,7 @@ impl Front {
             }
             AExpr::Attribute(a) => {
                 let obj = self.expr(&a.value, None)?;
-                let Ty::Class(c) = self.norm(&obj.ty) else {
+                let (Ty::Class(c) | Ty::Obj(c)) = self.norm(&obj.ty) else {
                     return err(line, "attribute assignment needs a class instance");
                 };
                 let name = a.attr.id.as_str();
@@ -970,7 +1498,9 @@ impl Front {
                     return err(line, format!("`{}` is frozen", self.p.classes[c].name));
                 }
                 *val = self.coerce(e, &fty, &format!("field `{}`", name))?;
-                Ok(Target::Place(self.mk(line, fty, ExprKind::Field(Box::new(obj), name.to_string()))))
+                let pl = self.mk(line, fty, ExprKind::Field(Box::new(obj), name.to_string()));
+                self.unnarrow(&pl);
+                Ok(Target::Place(pl))
             }
             _ => err(line, "unsupported assignment target"),
         }
@@ -1034,6 +1564,12 @@ impl Front {
                 let line = e.line;
                 Ok(self.mk(line, Ty::Bool, ExprKind::Builtin("truth", vec![e])))
             }
+            Ty::Optional(inner) if matches!(*inner, Ty::Class(_)) => {
+                let line = e.line;
+                Ok(self.mk(line, Ty::Bool, ExprKind::IsSome(Box::new(e), true, None)))
+            }
+            Ty::Optional(_) => err(e.line, "the truth value of an Optional number/str also tests 0 / \"\"")
+                .map_err(|e| e.hint("write `x is not None`")),
             _ => err(e.line, format!("{} has no truth value here", self.tn(&t))),
         }
     }
@@ -1059,7 +1595,16 @@ impl Front {
             },
             AExpr::BooleanLiteral(b) => self.mk(line, Ty::Bool, K::Bool(b.value)),
             AExpr::StringLiteral(s) => self.mk(line, Ty::Str, K::Str(s.value.to_str().to_string())),
-            AExpr::NoneLiteral(_) => return err(line, "None values are not supported yet (no Optional)"),
+            AExpr::NoneLiteral(_) => {
+                let t = match want.map(|w| self.norm(w)) {
+                    Some(t @ Ty::Optional(_)) => t,
+                    _ => {
+                        let v = self.fresh();
+                        Ty::opt(v)
+                    }
+                };
+                self.mk(line, t, K::NoneVal)
+            }
             AExpr::FString(f) => self.fstring(f, line)?,
             AExpr::Name(n) => self.name(n.id.as_str(), line)?,
             AExpr::BinOp(b) => {
@@ -1107,6 +1652,22 @@ impl Front {
             }
             AExpr::Compare(c) => self.compare(c, line)?,
             AExpr::If(i) => {
+                if let Some((place, pos, rest, cls)) = self.narrowing(&i.test) {
+                    if pos || rest.is_empty() {
+                        if let Some((pe, v)) = self.narrow_var(place, cls)? {
+                            let depth = self.narrow.len();
+                            let c = self.narrow_cond(pe, v, &rest, line)?;
+                            // the narrowed branch first
+                            let (yes, no) = if pos { (&i.body, &i.orelse) } else { (&i.orelse, &i.body) };
+                            let a = self.expr(yes, want)?;
+                            self.narrow.truncate(depth);
+                            let b = self.expr(no, want)?;
+                            let (a, b) = self.join(a, b, line)?;
+                            let t = a.ty.clone();
+                            return Ok(self.mk(line, t, K::IfExp(Box::new(c), Box::new(a), Box::new(b))));
+                        }
+                    }
+                }
                 let c = self.cond(&i.test)?;
                 let a = self.expr(&i.body, want)?;
                 let b = self.expr(&i.orelse, want)?;
@@ -1195,12 +1756,19 @@ impl Front {
                 }
                 let obj = self.expr(&a.value, None)?;
                 match self.norm(&obj.ty) {
-                    Ty::Class(c) => {
+                    Ty::Class(c) | Ty::Obj(c) => {
                         let name = a.attr.id.as_str();
                         match self.p.classes[c].field(name) {
                             Some(f) => {
                                 let t = f.ty.clone();
-                                self.mk(line, t, K::Field(Box::new(obj), name.to_string()))
+                                let fe = self.mk(line, t, K::Field(Box::new(obj), name.to_string()));
+                                match self.narrowed(&fe) {
+                                    Some(v) => {
+                                        let t = self.var(v).ty.clone();
+                                        self.mk(line, t, K::Var(v))
+                                    }
+                                    None => fe,
+                                }
                             }
                             None => {
                                 return err(line, format!("`{}` has no field `{}`", self.p.classes[c].name, name))
@@ -1240,7 +1808,12 @@ impl Front {
                     .map_err(|e| e.hint("copy it into another variable inside the loop"));
             }
             let t = var.ty.clone();
-            return Ok(self.mk(line, t, ExprKind::Var(v)));
+            let e = self.mk(line, t, ExprKind::Var(v));
+            if let Some(nv) = self.narrowed(&e) {
+                let t = self.var(nv).ty.clone();
+                return Ok(self.mk(line, t, ExprKind::Var(nv)));
+            }
+            return Ok(e);
         }
         if let Some(&c) = self.consts.get(n) {
             if c < self.p.consts.len() {
@@ -1327,6 +1900,24 @@ impl Front {
     }
 
     fn compare(&mut self, c: &ast::ExprCompare, line: u32) -> Res<Expr> {
+        // `x is None`, `x is not None` (also with == / !=)
+        if c.ops.len() == 1 {
+            let none = |e: &AExpr| matches!(e, AExpr::NoneLiteral(_));
+            let (a, b) = (&c.operands[0], &c.operands[1]);
+            if none(a) || none(b) {
+                let x = if none(a) { b } else { a };
+                let some = match c.ops[0] {
+                    ast::CmpOp::Is | ast::CmpOp::Eq => false,
+                    ast::CmpOp::IsNot | ast::CmpOp::NotEq => true,
+                    _ => return err(line, "None can only be compared with `is` / `is not`"),
+                };
+                let e = self.expr(x, None)?;
+                if !matches!(self.norm(&e.ty), Ty::Optional(_)) {
+                    return err(line, format!("this is {}, never None", self.tn(&e.ty)));
+                }
+                return Ok(self.mk(line, Ty::Bool, ExprKind::IsSome(Box::new(e), some, None)));
+            }
+        }
         let first = self.expr(&c.operands[0], None)?;
         let mut prev_ty = self.norm(&first.ty);
         let mut first = first;
@@ -1342,7 +1933,7 @@ impl Front {
                 ast::CmpOp::In => CmpOp::In,
                 ast::CmpOp::NotIn => CmpOp::NotIn,
                 ast::CmpOp::Is | ast::CmpOp::IsNot => {
-                    return err(line, "`is` is not supported (no Optional / identity yet)")
+                    return err(line, "`is` is only supported with None (no object identity)")
                         .map_err(|e| e.hint("use `==` to compare values"))
                 }
             };
@@ -1824,6 +2415,35 @@ impl Front {
                 }
                 self.builtin(name, args, want, line)
             }
+            AExpr::Attribute(a) if matches!(&*a.value, AExpr::Call(sc) if matches!(&*sc.func, AExpr::Name(n) if n.id.as_str() == "super")) => {
+                let m = a.attr.id.as_str();
+                let f = self.cur;
+                let (Some(c), Some(sv)) = (self.p.funcs[f].class, self.p.funcs[f].self_var) else {
+                    return err(line, "super() outside a method");
+                };
+                let Some(b) = self.p.classes[c].base else { return err(line, "super() in a class without a base class") };
+                if m == "__init__" {
+                    if !self.p.funcs[f].is_init {
+                        return err(line, "super().__init__() only inside __init__");
+                    }
+                    let Some(binit) = self.p.classes[b].init else {
+                        return err(line, format!("`{}` has no __init__", self.p.classes[b].name));
+                    };
+                    let a = self.call_args(binit, args, false, line)?;
+                    return Ok(self.mk(line, Ty::None, ExprKind::SuperInit(binit, a)));
+                }
+                let Some(fid) = self.p.classes[c].method(&format!("super_{}", m)) else {
+                    return err(line, format!("`{}` has no method `{}`", self.p.classes[b].name, m));
+                };
+                if self.p.funcs[f].is_init {
+                    return err(line, "methods cannot be called on `self` inside __init__");
+                }
+                let a = self.call_args(fid, args, true, line)?;
+                let t = self.p.funcs[fid].ret.clone();
+                let st = self.var(sv).ty.clone();
+                let recv = self.mk(line, st, ExprKind::Var(sv));
+                Ok(self.mk(line, t, ExprKind::Method(Box::new(recv), fid, a)))
+            }
             AExpr::Attribute(a) => {
                 let m = a.attr.id.as_str();
                 if let AExpr::Name(n) = &*a.value {
@@ -1860,6 +2480,20 @@ impl Front {
     }
 
     fn construct(&mut self, cid: ClassId, args: &ast::Arguments, line: u32) -> Res<Expr> {
+        if self.p.classes[cid].exc.is_some() {
+            return err(line, "exceptions can only be raised");
+        }
+        let e = self.construct_(cid, args, line)?;
+        if self.p.classes[cid].subs.is_empty() {
+            return Ok(e);
+        }
+        // an object of a class with subclasses: exactly this class, as the enum
+        let mut e = e;
+        e.ty = Ty::Obj(cid);
+        Ok(self.mk(line, Ty::Class(cid), ExprKind::Upcast(Box::new(e))))
+    }
+
+    fn construct_(&mut self, cid: ClassId, args: &ast::Arguments, line: u32) -> Res<Expr> {
         if let Some(init) = self.p.classes[cid].init {
             let a = self.call_args(init, args, false, line)?;
             return Ok(self.mk(line, Ty::Class(cid), ExprKind::New(cid, a)));
@@ -2228,7 +2862,13 @@ impl Front {
             "range" | "enumerate" | "zip" | "reversed" => {
                 err(line, format!("{}() can only be used in a for loop or as an argument of list()/sum()/...", name))
             }
-            "isinstance" | "type" | "id" | "hash" | "getattr" | "setattr" | "hasattr" | "eval" | "exec"
+            "isinstance" => {
+                self.nargs(args, 2, 2, name, line)?;
+                let x = self.expr(&args.args[0], None)?;
+                let d = self.class_arg(&args.args[1], line)?;
+                self.isinstance(x, d, None, line)
+            }
+            "type" | "id" | "hash" | "getattr" | "setattr" | "hasattr" | "eval" | "exec"
             | "globals" | "locals" | "vars" | "open" | "iter" | "next" | "map" | "filter" | "super" => {
                 err(line, format!("{}() is outside the typed subset", name))
             }
@@ -2237,11 +2877,44 @@ impl Front {
         }
     }
 
+    fn is_exception(&self, n: &str) -> bool {
+        EXCEPTIONS.contains(&n) || self.classes.get(n).map(|c| self.p.classes[*c].exc.is_some()).unwrap_or(false)
+    }
+
+    fn class_arg(&self, a: &AExpr, line: u32) -> Res<ClassId> {
+        match a {
+            AExpr::Name(n) => match self.classes.get(n.id.as_str()) {
+                Some(c) if self.p.classes[*c].exc.is_none() => Ok(*c),
+                _ => err(line, format!("`{}` is not a class of this program", n.id)),
+            },
+            _ => err(line, "isinstance() needs one class (no tuples)"),
+        }
+    }
+
+    /// `isinstance(x, d)`: constant when the static type decides it.
+    fn isinstance(&mut self, x: Expr, d: ClassId, var: Option<VarId>, line: u32) -> Res<Expr> {
+        let (Ty::Class(c) | Ty::Obj(c)) = self.norm(&x.ty) else {
+            return err(line, format!("isinstance() of {} is outside the typed subset", self.tn(&x.ty)));
+        };
+        let exact = matches!(self.norm(&x.ty), Ty::Obj(_)) || self.p.classes[c].subs.is_empty();
+        if self.p.is_sub(c, d) {
+            return Ok(self.mk(line, Ty::Bool, ExprKind::Bool(true)));
+        }
+        if exact || !self.p.is_sub(d, c) {
+            return Ok(self.mk(line, Ty::Bool, ExprKind::Bool(false)));
+        }
+        Ok(self.mk(line, Ty::Bool, ExprKind::IsInst(Box::new(x), d, var)))
+    }
+
     fn printable(&self, t: &Ty, line: u32) -> Res<()> {
         match self.norm(t) {
-            Ty::Class(c) => {
+            Ty::Class(c) | Ty::Obj(c) => {
                 let cl = &self.p.classes[c];
-                if cl.dataclass || cl.method("__str__").is_some() || cl.method("__repr__").is_some() {
+                let all = self.p.subtree(c).iter().all(|x| {
+                    let k = &self.p.classes[*x];
+                    k.dataclass || k.method("__str__").is_some() || k.method("__repr__").is_some()
+                });
+                if all {
                     Ok(())
                 } else {
                     err(line, format!("printing a `{}` shows its address; define __str__ or use @dataclass", cl.name))
@@ -2254,6 +2927,8 @@ impl Front {
             }
             Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.printable(t, line)),
             Ty::None => err(line, "cannot print None"),
+            Ty::Exc => Ok(()),
+            Ty::Optional(t) => self.printable(&t, line),
             _ => Ok(()),
         }
     }
@@ -2309,9 +2984,16 @@ impl Front {
         };
         let _ = want;
         match &rt {
-            Ty::Class(c) => {
+            Ty::Class(c) | Ty::Obj(c) => {
                 let c = *c;
-                let Some(fid) = self.p.classes[c].method(m) else {
+                // a value that may be a subclass calls through the dispatcher
+                let disp = match &rt {
+                    Ty::Class(_) if !self.p.classes[c].subs.is_empty() => {
+                        self.p.classes[c].dispatch.iter().find(|(n, _)| n == m).map(|(_, f)| *f)
+                    }
+                    _ => None,
+                };
+                let Some(fid) = disp.or_else(|| self.p.classes[c].method(m)) else {
                     return err(line, format!("`{}` has no method `{}`", self.p.classes[c].name, m));
                 };
                 if m == "__init__" {
@@ -2395,9 +3077,10 @@ impl Front {
                 let (kt, vt) = ((**kt).clone(), (**vt).clone());
                 match m {
                     "get" => {
-                        if args.args.len() != 2 {
-                            return err(line, "dict.get(key) returns Optional; use dict.get(key, default)")
-                                .map_err(|e| e.hint("Optional is not supported yet"));
+                        self.nargs(args, 1, 2, m, line)?;
+                        if args.args.len() == 1 {
+                            let k = self.arg(args, 0, &kt, "key")?;
+                            return b(self, "dict.get_opt", Ty::opt(vt), vec![k], recv);
                         }
                         let k = self.arg(args, 0, &kt, "key")?;
                         let d = self.arg(args, 1, &vt, "default")?;
@@ -2612,6 +3295,7 @@ fn has_var(t: &Ty) -> bool {
         Ty::List(a) | Ty::Set(a) => has_var(a),
         Ty::Dict(k, v) => has_var(k) || has_var(v),
         Ty::Tuple(ts) => ts.iter().any(has_var),
+        Ty::Optional(t) => has_var(t),
         _ => false,
     }
 }
@@ -2677,17 +3361,18 @@ fn check_spec(spec: &str, t: &Ty) -> Result<(), String> {
 pub fn children_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
     use ExprKind::*;
     match &mut e.kind {
-        Int(_) | Float(_) | Bool(_) | Str(_) | NoneLit | Var(_) | Const(_) => {}
+        Int(_) | Float(_) | Bool(_) | Str(_) | NoneLit | NoneVal | Var(_) | Const(_) => {}
         Bin(_, a, b) | Index(a, b) => {
             f(a);
             f(b)
         }
-        Unary(_, a) | ToFloat(a) | Field(a, _) | TupleField(a, _) | Lambda(_, a) => f(a),
+        Unary(_, a) | ToFloat(a) | Field(a, _) | TupleField(a, _) | Lambda(_, a) | SomeOf(a) | IsSome(a, _, _)
+        | Upcast(a) | IsInst(a, _, _) => f(a),
         Cmp(a, rest) => {
             f(a);
             rest.iter_mut().for_each(|(_, e)| f(e))
         }
-        And(v) | Or(v) | List(v) | Tuple(v) | Set(v) | Call(_, v) | New(_, v) | Builtin(_, v) => {
+        And(v) | Or(v) | List(v) | Tuple(v) | Set(v) | Call(_, v) | New(_, v) | Builtin(_, v) | SuperInit(_, v) => {
             v.iter_mut().for_each(|e| f(e))
         }
         IfExp(a, b, c) => {
@@ -2781,6 +3466,16 @@ fn visit_stmt_exprs_mut(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
         }
         StmtKind::Return(Some(e)) => f(e),
         StmtKind::Raise(_, Some(e)) => f(e),
+        StmtKind::LetSome(_, e, b) => {
+            f(e);
+            b.iter_mut().for_each(|s| visit_stmt_exprs_mut(s, f))
+        }
+        StmtKind::Try(b, hs, e, fi) => {
+            b.iter_mut().chain(e.iter_mut()).chain(fi.iter_mut()).for_each(|s| visit_stmt_exprs_mut(s, f));
+            for h in hs {
+                h.body.iter_mut().for_each(|s| visit_stmt_exprs_mut(s, f));
+            }
+        }
         StmtKind::Assert(c, m) => {
             f(c);
             if let Some(m) = m {

@@ -11,7 +11,7 @@ pub fn pyrt_dir() -> PathBuf {
 
 pub fn cargo_toml(name: &str, bins: &[String]) -> String {
     let mut s = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\npyrt = {{ path = {:?} }}\n\n\
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\npyrt = {{ path = {:?} }}\n\n\
          # Python ints never wrap: overflow is reported instead\n[profile.release]\noverflow-checks = true\n",
         name,
         pyrt_dir()
