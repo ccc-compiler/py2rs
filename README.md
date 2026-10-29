@@ -185,7 +185,8 @@ lookaround and backreferences (the regex crate has neither), `$` without `re.M`
 replacements; `Match.group(n)` of a group that did not take part raises (Python gives
 None).
 
-Known differences: set iteration order is insertion order (CPython's is hash order);
+Known differences: set iteration order is insertion order (CPython's is hash order;
+see TODO.md);
 `int` is 64-bit.
 
 ## Layout

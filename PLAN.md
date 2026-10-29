@@ -13,8 +13,33 @@ rejection has a test in `tests/err/`.
 | v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time | done |
 | v0.7 | `with`, files, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | done |
 | v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | done |
-| v0.9 | benchmarks vs CPython, ASCII strings, fewer clones, buffered print, optional bigint / fixed-width ints, CPython set order | |
+| v0.9 | benchmarks vs CPython, faster strings, sorting and dicts, buffered print (CPython set order: see TODO.md) | done |
 | v1.0 | crates.io packages (publish needs the owner's go-ahead), docs in three languages, subset spec, case studies, PyO3 module output | |
+
+## v0.9 result
+
+`python3 bench/run.py` (CPython 3.14 vs `py2rs build`, best of 3, Apple silicon):
+
+| program | CPython (s) | Rust (s) | speedup |
+|---|---:|---:|---:|
+| fib | 0.258 | 0.013 | 20x |
+| graph | 0.138 | 0.017 | 8x |
+| matmul | 0.473 | 0.013 | 38x |
+| nbody | 1.207 | 0.012 | 101x |
+| objects | 0.591 | 0.101 | 6x |
+| printing | 0.211 | 0.056 | 4x |
+| sieve | 0.479 | 0.027 | 18x |
+| strings | 0.146 | 0.079 | 2x |
+| wordfreq | 0.479 | 0.240 | 2x |
+
+- a loop that indexes or measures a string it does not reassign gets its characters /
+  length once (`hoist_strs`, `pyrt::char_at`): `strings` went from 52 s to 0.08 s
+- `sort(key=...)` computes each key once (like CPython) and permutes in place
+- `print` writes to a buffer (`pyrt::out`, `use pyrt::{print, println}`), flushed at the
+  end, before input, before a traceback, at `sys.exit`
+- `d[k] = d.get(k, 0) + x` → one `get_mut`, the key copied only when new
+- `for w in text.split()` borrows the pieces instead of building a list
+- not done: bigints / fixed-width ints, CPython set order (TODO.md)
 
 ## v0.8 result
 

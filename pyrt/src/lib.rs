@@ -3,7 +3,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 
 pub use indexmap::{IndexMap, IndexSet};
 
@@ -12,6 +12,8 @@ pub mod math;
 #[cfg(feature = "re")]
 pub mod re;
 pub mod files;
+pub mod out;
+pub use out::flush;
 pub mod generator;
 pub use generator::Gen;
 pub mod spec;
@@ -31,7 +33,7 @@ pub fn raise(exc: &str, msg: &str) -> ! {
     if err::catching_now() {
         std::panic::panic_any(PyErr::new(err::builtin_chain(exc), msg));
     }
-    let _ = std::io::stdout().flush();
+    crate::out::flush();
     eprintln!("Traceback (most recent call last):");
     if msg.is_empty() {
         eprintln!("{}", exc);
@@ -80,7 +82,7 @@ pub fn init() {
         } else {
             "panic".to_string()
         };
-        let _ = std::io::stdout().flush();
+        crate::out::flush();
         eprintln!("Traceback (most recent call last):");
         eprintln!("{}", exception_of(&msg));
         std::process::exit(1);
@@ -965,8 +967,8 @@ pub fn fmin(a: f64, b: f64) -> f64 {
 
 /// `input(prompt)`
 pub fn input(prompt: &str) -> String {
-    print!("{}", prompt);
-    let _ = std::io::stdout().flush();
+    crate::out::write_out(format_args!("{}", prompt));
+    crate::out::flush();
     let mut s = String::new();
     match std::io::stdin().lock().read_line(&mut s) {
         Ok(0) | Err(_) => raise("EOFError", "EOF when reading a line"),
@@ -991,12 +993,39 @@ pub fn sorted_rev<T: PyOrd, I: IntoIterator<Item = T>>(it: I) -> Vec<T> {
 
 /// `xs.sort(key=f)`
 pub fn sort_by_key<T, K: PyOrd>(xs: &mut [T], key: impl Fn(&T) -> K) {
-    xs.sort_by(|a, b| key(a).py_cmp(&key(b)));
+    // each key is computed once, like CPython
+    let keys: Vec<K> = xs.iter().map(&key).collect();
+    let mut idx: Vec<usize> = (0..xs.len()).collect();
+    idx.sort_by(|&a, &b| keys[a].py_cmp(&keys[b]));
+    permute(xs, &idx);
+}
+
+/// `xs[i] = old xs[idx[i]]`, in place
+fn permute<T>(xs: &mut [T], idx: &[usize]) {
+    let mut done = vec![false; xs.len()];
+    for i in 0..xs.len() {
+        if done[i] {
+            continue;
+        }
+        let mut j = i;
+        loop {
+            done[j] = true;
+            let k = idx[j];
+            if k == i {
+                break;
+            }
+            xs.swap(j, k);
+            j = k;
+        }
+    }
 }
 
 /// `xs.sort(key=f, reverse=True)`
 pub fn sort_by_key_rev<T, K: PyOrd>(xs: &mut [T], key: impl Fn(&T) -> K) {
-    xs.sort_by(|a, b| key(b).py_cmp(&key(a)));
+    let keys: Vec<K> = xs.iter().map(&key).collect();
+    let mut idx: Vec<usize> = (0..xs.len()).collect();
+    idx.sort_by(|&a, &b| keys[b].py_cmp(&keys[a]));
+    permute(xs, &idx);
 }
 
 /// `sorted(it, key=f)`

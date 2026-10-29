@@ -22,6 +22,26 @@ pub fn str_at(s: &str, i: i64) -> String {
     s.chars().nth(k as usize).unwrap().to_string()
 }
 
+/// `s[i]` of a string whose characters a loop collected once
+pub fn char_at(cs: &[char], i: i64) -> String {
+    let n = cs.len() as i64;
+    let k = if i < 0 { i + n } else { i };
+    if k < 0 || k >= n {
+        raise("IndexError", "string index out of range");
+    }
+    cs[k as usize].to_string()
+}
+
+/// `try_` variant of `char_at`
+pub fn try_char_at(cs: &[char], i: i64) -> Result<String, crate::PyErr> {
+    crate::catching(|| char_at(cs, i))
+}
+
+/// `s[a:b:c]` of a string whose characters a loop collected once
+pub fn chars_slice(cs: &[char], lo: Option<i64>, hi: Option<i64>, step: Option<i64>) -> String {
+    crate::slice_indices(cs.len(), lo, hi, step).into_iter().map(|i| cs[i]).collect()
+}
+
 /// `s[a:b:c]`
 pub fn str_slice(s: &str, lo: Option<i64>, hi: Option<i64>, step: Option<i64>) -> String {
     let cs: Vec<char> = s.chars().collect();
@@ -64,6 +84,11 @@ pub fn rstrip_chars(s: &str, chars: &str) -> String {
 /// `s.split()`
 pub fn split_ws(s: &str) -> Vec<String> {
     s.split(is_space).filter(|w| !w.is_empty()).map(String::from).collect()
+}
+
+/// `for w in s.split()` without the list
+pub fn split_ws_iter(s: &str) -> impl Iterator<Item = &str> {
+    s.split(is_space).filter(|w| !w.is_empty())
 }
 
 /// `s.split(sep)`

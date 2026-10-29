@@ -120,3 +120,8 @@ Generated projects use edition 2024 (let chains).
   `static_isinstance` in `lower_if`, `protocols`); `src/modules.rs` (`combine`,
   `translate_file`, `local_name` for `m.x`); `Class.shared` (own: immutable / no `&mut`
   / self may escape; gen: `shared_struct`, accessors through `is_enum`).
+- v0.9: `bench/run.py` (CPython vs `py2rs build`); `FGen::hoist_strs` / `char_vecs` /
+  `str_lens`; `pyrt::out` (buffered `print!` / `println!` macros imported by generated
+  code, `pyrt::flush()` at the end of main); key-once `sort_by_key` (`permute`);
+  `d[k] = d.get(k, 0) + x` peephole in `store`; borrowed `split` in for loops. Known
+  differences still to fix: TODO.md.

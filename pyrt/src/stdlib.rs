@@ -611,15 +611,14 @@ pub fn argv() -> Vec<String> {
 
 /// `sys.exit(code)`
 pub fn exit(code: i64) -> ! {
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+    crate::out::flush();
     std::process::exit(code as i32)
 }
 
 /// `sys.stdin.readline()` (with the newline; "" at the end)
 pub fn readline() -> String {
-    use std::io::{BufRead, Write};
-    let _ = std::io::stdout().flush();
+    use std::io::BufRead;
+    crate::out::flush();
     let mut s = String::new();
     let _ = std::io::stdin().lock().read_line(&mut s);
     s
@@ -653,7 +652,9 @@ pub fn lines() -> Vec<String> {
 /// Runs the program on a thread with a 1 GB stack (`sys.setrecursionlimit`).
 pub fn with_stack(f: fn()) {
     let t = std::thread::Builder::new().stack_size(1 << 30).spawn(f).expect("thread");
-    if t.join().is_err() {
+    let ok = t.join().is_ok();
+    crate::out::flush();
+    if !ok {
         std::process::exit(1);
     }
 }

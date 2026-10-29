@@ -463,6 +463,13 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     if uses_map.2 {
         v.push("VecDeque");
     }
+    // printing goes through pyrt's buffered output
+    if out.contains("print!(") {
+        v.push("print");
+    }
+    if out.contains(" println!(") || out.contains("\tprintln!(") || out.contains("{println!(") {
+        v.push("println");
+    }
     if OR_RAISE.with(|c| c.get()) {
         v.push("OrRaise");
     }
@@ -944,6 +951,9 @@ struct FGen<'a> {
     loop_labels: Vec<Option<String>>,
     /// enclosing loops: (label, label used, labeled blocks between here and the loop)
     loops: Vec<(String, bool, u32)>,
+    /// strings whose characters / length a loop computed before it (`hoist_strs`)
+    char_vecs: HashMap<VarId, String>,
+    str_lens: HashMap<VarId, String>,
     /// `finally` blocks of the enclosing `try`s and the loop depth at each: a return,
     /// break or continue runs them first
     finals: Vec<(Vec<Stmt>, usize)>,
@@ -990,6 +1000,8 @@ impl<'a> FGen<'a> {
             labels: 0,
             loop_labels: vec![],
             finals: vec![],
+            char_vecs: HashMap::new(),
+            str_lens: HashMap::new(),
             loops: vec![],
             loopn: 0,
             init_fields: HashMap::new(),
@@ -1192,6 +1204,8 @@ impl<'a> FGen<'a> {
                 };
                 out += &format!("{}{}\n", inner, ok(v, self));
             }
+        } else if is_main {
+            out += &format!("{}pyrt::flush();\n", inner);
         } else if matches!(f.ret, Ty::Optional(_)) && !always_exits(body) {
             out += &format!("{}{}\n", inner, ok("None".into(), self));
         } else if f.ret == Ty::None && self.x.fallible[self.fid] && !always_exits(body) {
@@ -1624,12 +1638,94 @@ impl<'a> FGen<'a> {
     fn stmt(&mut self, s: &Stmt, ind: &str, out: &mut String) -> Res<()> {
         let mut buf = String::new();
         let saved = std::mem::take(&mut self.pre);
+        let hoisted = self.hoist_strs(s);
         let r = self.stmt_inner(s, ind, &mut buf);
+        for (v, _) in &hoisted {
+            self.char_vecs.remove(v);
+            self.str_lens.remove(v);
+        }
         for p in std::mem::replace(&mut self.pre, saved) {
             out.push_str(&format!("{}{}\n", ind, p));
         }
+        for (_, line) in hoisted {
+            out.push_str(&format!("{}{}\n", ind, line));
+        }
         out.push_str(&buf);
         r
+    }
+
+    /// Is `v` assigned more than once in this function (parameters: at all)?
+    fn assigned_in_fn(&self, v: VarId) -> bool {
+        let n = assign_count(&self.f.body, v, &self.o.live_out);
+        match self.f.vars[v].kind {
+            VarKind::Param => n > 0,
+            _ => n > 1,
+        }
+    }
+
+    /// A loop that indexes (or measures) a string it does not reassign: its
+    /// characters (or length) once before the loop, not at every access.
+    fn hoist_strs(&mut self, s: &Stmt) -> Vec<(VarId, String)> {
+        let body = match &s.kind {
+            StmtKind::For(_, _, b, _) | StmtKind::While(_, b, _) => b,
+            _ => return vec![],
+        };
+        let mut assigned = assigned_vars(body);
+        if let StmtKind::For(t, _, _, _) = &s.kind {
+            let mut vs = vec![];
+            t.vars(&mut vs);
+            assigned.extend(vs);
+        }
+        let (mut indexed, mut measured) = (vec![], vec![]);
+        fn ex(e: &Expr, ix: &mut Vec<VarId>, ms: &mut Vec<VarId>) {
+            match &e.kind {
+                ExprKind::Index(b, _) | ExprKind::Slice(b, ..) if b.ty == Ty::Str => {
+                    if let ExprKind::Var(v) = b.kind {
+                        ix.push(v);
+                    }
+                }
+                ExprKind::Builtin("len", a) if a[0].ty == Ty::Str => {
+                    if let ExprKind::Var(v) = a[0].kind {
+                        ms.push(v);
+                    }
+                }
+                _ => {}
+            }
+            e.children(&mut |c| ex(c, ix, ms));
+        }
+        fn st(s: &Stmt, ix: &mut Vec<VarId>, ms: &mut Vec<VarId>) {
+            stmt_exprs(s, &mut |e| ex(e, ix, ms));
+            if let StmtKind::For(_, it, _, _) = &s.kind {
+                it.exprs(&mut |e| ex(e, ix, ms));
+            }
+            s.blocks().iter().for_each(|b| b.iter().for_each(|x| st(x, ix, ms)));
+        }
+        st(s, &mut indexed, &mut measured);
+        let mut out = vec![];
+        let ok = |g: &Self, v: &VarId| {
+            !assigned.contains(v) && !g.char_vecs.contains_key(v) && !g.str_lens.contains_key(v) && g.declared.contains(v)
+        };
+        indexed.sort();
+        indexed.dedup();
+        for v in indexed {
+            if ok(self, &v) {
+                let n = self.name(v);
+                let cv = format!("{}_chars", n.trim_start_matches("r#"));
+                out.push((v, format!("let {}: Vec<char> = {}.chars().collect();", cv, n)));
+                self.char_vecs.insert(v, cv);
+            }
+        }
+        measured.sort();
+        measured.dedup();
+        for v in measured {
+            if ok(self, &v) {
+                let n = self.name(v);
+                let ln = format!("{}_len", n.trim_start_matches("r#"));
+                out.push((v, format!("let {} = {}.chars().count() as i64;", ln, n)));
+                self.str_lens.insert(v, ln);
+            }
+        }
+        out
     }
 
     fn stmt_inner(&mut self, s: &Stmt, ind: &str, out: &mut String) -> Res<()> {
@@ -2081,6 +2177,7 @@ impl<'a> FGen<'a> {
                 let ty = &self.f.vars[v].ty;
                 let val = match k {
                     Kind::Ref | Kind::Mut if ty.is_copy() => format!("*{}", name),
+                    Kind::Ref | Kind::Mut if *ty == Ty::Str => format!("{}.to_string()", name),
                     Kind::Ref | Kind::Mut => format!("{}.clone()", name),
                     _ => name.clone(),
                 };
@@ -2254,6 +2351,31 @@ impl<'a> FGen<'a> {
 
     /// `xs[i] = v`, `d[k] = v`, `obj.f = v`
     fn store(&mut self, pl: &Expr, v: &Expr, ind: &str, out: &mut String) -> Res<()> {
+        // `d[k] = d.get(k, 0) + x`: one lookup, the key copied only when it is new
+        if let (ExprKind::Index(b, k), ExprKind::Bin(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), l, x)) = (&pl.kind, &v.kind) {
+            if let ExprKind::Builtin("dict.get", ga) = &l.kind {
+                let plain = matches!(b.ty, Ty::Dict(_, _, DK::Plain));
+                let mut u = vec![];
+                uses(x, &mut u);
+                let root = match &b.kind {
+                    ExprKind::Var(r) => Some(*r),
+                    _ => None,
+                };
+                if plain && v.ty.is_copy() && same_expr(&ga[0], b) && same_expr(&ga[1], k) && root.is_some_and(|r| !u.contains(&r)) {
+                    let xv = self.val(x)?.code;
+                    let dv = self.val(&ga[2])?.code;
+                    let base = self.ex_mut(b)?;
+                    let kb = self.borrow(k)?;
+                    let ko = self.owned(k)?;
+                    let sym = crate::front::opstr(*op);
+                    out.push_str(&format!(
+                        "{0}if let Some(e) = {1}.get_mut({2}) {{\n{0}    *e {3}= {4};\n{0}}} else {{\n{0}    {1}.insert({5}, {6} {3} {4});\n{0}}}\n",
+                        ind, par(&base, ATOM), kb, sym, xv, ko, dv
+                    ));
+                    return Ok(());
+                }
+            }
+        }
         let mut val = self.owned(v)?;
         // a value that reads the container being written is computed first
         let mut root = pl;
@@ -2857,6 +2979,24 @@ impl<'a> FGen<'a> {
                 let base = self.ex(b)?;
                 let kb = self.borrow(k)?;
                 r(format!("{}.get_count({})", par(&base, ATOM), kb), Kind::Val, ATOM)
+            }
+            K::Index(b, k) if matches!(&b.kind, K::Var(v) if self.char_vecs.contains_key(v)) => {
+                let K::Var(v) = &b.kind else { unreachable!() };
+                let cv = self.char_vecs[v].clone();
+                let i = self.val(k)?;
+                r(self.may_fail("IndexError", "char_at", format!("&{}, {}", cv, i.code)), Kind::Val, ATOM)
+            }
+            K::Slice(b, lo, hi, st) if matches!(&b.kind, K::Var(v) if self.char_vecs.contains_key(v)) => {
+                let K::Var(v) = &b.kind else { unreachable!() };
+                let cv = self.char_vecs[v].clone();
+                let opt = |x: &Option<Box<Expr>>, g: &mut Self| -> Res<String> {
+                    Ok(match x {
+                        Some(e) => format!("Some({})", g.val(e)?.code),
+                        None => "None".into(),
+                    })
+                };
+                let (l, h, s) = (opt(lo, self)?, opt(hi, self)?, opt(st, self)?);
+                r(format!("pyrt::chars_slice(&{}, {}, {}, {})", cv, l, h, s), Kind::Val, ATOM)
             }
             K::Index(b, k) => {
                 let base = self.ex(b)?;
@@ -3693,6 +3833,20 @@ impl<'a> FGen<'a> {
                 let v = format!("Vec::<{}>::new()", self.elem_ty(&x.ty));
                 (if for_loop { v } else { format!("{}.into_iter()", v) }, Item::Val)
             }
+            // `for w in text.split()`: the pieces borrowed, no list (text is not reassigned
+            // while they are in use: it is a variable the enclosing code does not assign)
+            Iter::Over(Expr { kind: ExprKind::Builtin(n @ ("str.split_ws" | "str.split"), a), .. })
+                if for_loop && matches!(&a[0].kind, ExprKind::Var(v) if !self.assigned_in_fn(*v))
+                    && a.get(1).is_none_or(|sep| matches!(&sep.kind, ExprKind::Str(s) if !s.is_empty())) =>
+            {
+                let s = self.borrow_str(&a[0])?;
+                let code = if *n == "str.split_ws" {
+                    format!("pyrt::split_ws_iter({})", s)
+                } else {
+                    format!("{}.split({})", par(&r(s, Kind::Val, UNARY), ATOM), self.borrow_str(&a[1])?)
+                };
+                (code, Item::Ref)
+            }
             Iter::Over(x) if matches!(x.ty, Ty::Gen(_)) && !matches!(x.kind, ExprKind::Call(..)) => {
                 // a generator object in a variable: advance it in place
                 let c = self.ex_mut(x)?;
@@ -4165,6 +4319,13 @@ impl<'a> FGen<'a> {
                     Ty::Int => r(format!("{} != 0", par(&self.val_r(x), CMP + 1)), Kind::Val, CMP),
                     Ty::Float => r(format!("{} != 0.0", par(&self.val_r(x), CMP + 1)), Kind::Val, CMP),
                     _ => r(format!("!{}.is_empty()", par(&x, ATOM)), Kind::Val, UNARY),
+                }
+            }
+            "len" if matches!(&a[0].kind, ExprKind::Var(v) if self.char_vecs.contains_key(v) || self.str_lens.contains_key(v)) => {
+                let ExprKind::Var(w) = &a[0].kind else { unreachable!() };
+                match self.char_vecs.get(w) {
+                    Some(cv) => r(format!("{}.len() as i64", cv), Kind::Val, CAST),
+                    None => v(self.str_lens[w].clone()),
                 }
             }
             "len" => {
@@ -5072,5 +5233,17 @@ fn fn_arg_ty(t: &Ty, p: &Program) -> String {
         Ty::Str => "&str".into(),
         Ty::List(e) => format!("&[{}]", rty(e, p)),
         t => format!("&{}", rty(t, p)),
+    }
+}
+
+/// The same variable / field / literal (for patterns like `d[k] = d.get(k, 0) + 1`).
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    match (&a.kind, &b.kind) {
+        (ExprKind::Var(x), ExprKind::Var(y)) => x == y,
+        (ExprKind::Int(x), ExprKind::Int(y)) => x == y,
+        (ExprKind::Str(x), ExprKind::Str(y)) => x == y,
+        (ExprKind::Field(o, f), ExprKind::Field(p, g)) => f == g && same_expr(o, p),
+        (ExprKind::TupleField(o, i), ExprKind::TupleField(p, j)) => i == j && same_expr(o, p),
+        _ => false,
     }
 }
