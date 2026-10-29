@@ -80,4 +80,11 @@ Generated projects use edition 2024 (let chains).
   from locals (`assigned_while_live`), `Param.force` (`Ref`/`Mut`/`Own` from
   `from rust import`, module `python/rust` for CPython; the test runner sets PYTHONPATH),
   `py2rs explain` (`lib::explain`, copies recorded in `gen::clones`).
+- v0.5 crates: `front::load_stub` (`from rust.X import` → `X.pyi` in `stubs/`, `PY2RS_STUBS`,
+  repo `stubs/`; `# crate:` line → `Program.crates` → `// py2rs-crate:` header →
+  `project::crates_of` → Cargo.toml), extern classes (`Class.ext`) and functions
+  (`Func.ext`: path / method / template with `{self}` `{0}`, `result`, `self_mut`,
+  `ret_width`; `Param.width`), `gen::ext_call`, `pyrt::rust_ok` / `rust_err`;
+  `stubgen.rs` + `py2rs stub` (rustdoc JSON via `cargo doc` with RUSTDOCFLAGS
+  `--output-format json`); CPython stand-ins in `python/rust/` (`regex.py`); `inline`.
 

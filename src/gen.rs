@@ -81,7 +81,10 @@ pub fn rty(t: &Ty, p: &Program) -> String {
                 format!("({})", v.join(", "))
             }
         }
-        Ty::Class(c) => p.classes[*c].name.clone(),
+        Ty::Class(c) => match &p.classes[*c].ext {
+            Some(path) => path.rsplit("::").next().unwrap().to_string(),
+            None => p.classes[*c].name.clone(),
+        },
         Ty::Obj(c) => struct_name(p, *c),
         Ty::Exc => "PyErr".into(),
         Ty::Optional(t) => match &**t {
@@ -362,13 +365,13 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     let inst = instantiated(p);
     let fields = enum_fields(p);
     for (ci, c) in p.classes.iter().enumerate() {
-        if c.exc.is_some() {
+        if c.exc.is_some() || c.ext.is_some() {
             continue;
         }
         out += &gen_class(p, o, x, ci, c, &inst, &fields)?;
     }
     for (fid, f) in p.funcs.iter().enumerate() {
-        if f.class.is_some() || fid == p.main {
+        if f.class.is_some() || fid == p.main || f.ext.is_some() {
             continue;
         }
         let mut g = FGen::new(p, o, x, fid);
@@ -396,6 +399,20 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
         1 => format!("use pyrt::{};\n\n", v[0]),
         _ => format!("use pyrt::{{{}}};\n\n", v.join(", ")),
     };
+    // crates (read by the project writer) and their types
+    let mut crate_head = String::new();
+    for c in &p.crates {
+        crate_head += &format!("// py2rs-crate: {}\n", c);
+    }
+    let mut uses_ext: Vec<String> = p.classes.iter().filter_map(|c| c.ext.clone()).filter(|x| x.contains("::")).collect();
+    uses_ext.sort();
+    uses_ext.dedup();
+    for u in &uses_ext {
+        crate_head += &format!("use {};\n", u);
+    }
+    if !crate_head.is_empty() {
+        head = format!("{}{}", crate_head, if head.is_empty() { "\n".to_string() } else { head });
+    }
     // exception classes raised as values: their name and bases, most specific first
     let used = EXC_USED.with(|c| c.borrow().clone());
     let mut any = false;
@@ -2319,6 +2336,7 @@ impl<'a> FGen<'a> {
         Ok(match &e.ty {
             Ty::Int => self.val_r(x).code,
             Ty::Str => x.code,
+            Ty::Class(c) if self.p.classes[*c].ext.is_some() => x.code,
             _ => format!("pyrt::s({})", self.borrow_r(&x)),
         })
     }
@@ -2452,6 +2470,12 @@ impl<'a> FGen<'a> {
                     (self.owned(a)?, self.owned(b)?)
                 };
                 r(format!("if {} {{ {} }} else {{ {} }}", cv, av, bv), Kind::Val, LOW)
+            }
+            K::Call(fid, args) if self.p.funcs[*fid].ext.is_some() => r(self.ext_call(*fid, None, args)?, Kind::Val, ATOM),
+            K::Method(recv, fid, args) if self.p.funcs[*fid].ext.is_some() => r(self.ext_call(*fid, Some(recv), args)?, Kind::Val, ATOM),
+            K::New(c, args) if self.p.classes[*c].ext.is_some() => {
+                let init = self.p.classes[*c].init.unwrap();
+                r(self.ext_call(init, None, args)?, Kind::Val, ATOM)
             }
             K::Call(fid, args) => {
                 let f = &self.p.funcs[*fid];
@@ -3099,6 +3123,66 @@ impl<'a> FGen<'a> {
         }
     }
 
+    /// A call of a crate function (`recv`: the receiver of a method).
+    fn ext_call(&mut self, fid: FuncId, recv: Option<&Expr>, args: &[Expr]) -> Res<String> {
+        let f = &self.p.funcs[fid];
+        let x = f.ext.clone().unwrap();
+        let mut av = vec![];
+        for (i, a) in args.iter().enumerate() {
+            let q = &f.params[i];
+            let s = match self.o.params[fid][i] {
+                Mode::Copy => {
+                    let v = self.val(a)?;
+                    match &q.width {
+                        Some(w) => format!("{} as {}", par(&v, CAST), w),
+                        None => v.code,
+                    }
+                }
+                Mode::Owned => self.owned(a)?,
+                Mode::Ref if a.ty == Ty::Str => self.borrow_str(a)?,
+                Mode::Ref => self.borrow(a)?,
+                Mode::Mut => {
+                    let e = self.ex_mut(a)?;
+                    self.mut_ref_of(&e)
+                }
+            };
+            av.push(s);
+        }
+        let rv = match recv {
+            Some(r) => {
+                let e = if x.self_mut { self.ex_mut(r)? } else { self.ex(r)? };
+                Some(par(&e, ATOM))
+            }
+            None => None,
+        };
+        let mut code = if x.rust.contains('{') {
+            let mut c = x.rust.clone();
+            if let Some(r) = &rv {
+                c = c.replace("{self}", r);
+            }
+            for (i, a) in av.iter().enumerate() {
+                c = c.replace(&format!("{{{}}}", i), a);
+            }
+            c
+        } else if let Some(r) = &rv {
+            format!("{}.{}({})", r, x.rust, av.join(", "))
+        } else {
+            format!("{}({})", x.rust, av.join(", "))
+        };
+        if x.result {
+            code = if self.catches(&["ValueError"]) {
+                self.wrap(format!("{}.map_err(pyrt::rust_err)", code))
+            } else {
+                format!("pyrt::rust_ok({})", code)
+            };
+        }
+        if let Some(w) = &x.ret_width {
+            let t = if w == "f32" { "f64" } else { "i64" };
+            code = format!("({}) as {}", code, t);
+        }
+        Ok(code)
+    }
+
     /// Arguments of a user function call, by parameter mode.
     fn args(&mut self, fid: FuncId, args: &[Expr]) -> Res<String> {
         let mut out = vec![];
@@ -3676,6 +3760,15 @@ impl<'a> FGen<'a> {
                         all.push(en.code);
                         v(format!("print!(\"{}\", {})", fmt, all.join(", ")))
                     }
+                }
+            }
+            "inline" | "inline_expr" => {
+                let ExprKind::Str(code) = &a[0].kind else { unreachable!() };
+                let code = code.trim().trim_end_matches(';').to_string();
+                if name == "inline" {
+                    v(format!("{{ {} }}", code))
+                } else {
+                    r(code, Kind::Val, LOW)
                 }
             }
             "exc.is" => {

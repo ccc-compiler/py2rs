@@ -10,7 +10,21 @@ use ruff_text_size::Ranged;
 use crate::diag::{err, Error, Res};
 use crate::ir::*;
 
+/// Where crate stubs (`regex.pyi` for `from rust.regex import ...`) are looked up.
+pub fn default_stub_dirs() -> Vec<std::path::PathBuf> {
+    let mut v = vec![std::path::PathBuf::from("stubs")];
+    if let Ok(p) = std::env::var("PY2RS_STUBS") {
+        v.extend(std::env::split_paths(&p));
+    }
+    v.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stubs"));
+    v
+}
+
 pub fn lower(src: &str) -> Res<Program> {
+    lower_with(src, &default_stub_dirs())
+}
+
+pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
     let parsed = match ruff_python_parser::parse_module(src) {
         Ok(p) => p,
         Err(e) => {
@@ -36,6 +50,8 @@ pub fn lower(src: &str) -> Res<Program> {
         loops: 0,
         narrow: Vec::new(),
         handlers: Vec::new(),
+        stub_dirs: stub_dirs.to_vec(),
+        in_stub: None,
     };
     f.module(&module.body)?;
     f.finish()?;
@@ -61,6 +77,19 @@ struct Front {
     narrow: Vec<((VarId, Vec<String>), VarId)>,
     /// the exception variables of the enclosing except clauses
     handlers: Vec<VarId>,
+    stub_dirs: Vec<std::path::PathBuf>,
+    /// lowering a crate stub: the crate name
+    in_stub: Option<String>,
+}
+
+/// `usize`, `u32`, ... in stubs: Rust number types of extern parameters / results.
+const WIDTHS: &[&str] = &["usize", "isize", "u64", "u32", "u16", "u8", "i32", "i16", "i8", "f32"];
+
+fn width_of(a: &AExpr) -> Option<String> {
+    match a {
+        AExpr::Name(n) if WIDTHS.contains(&n.id.as_str()) => Some(n.id.to_string()),
+        _ => None,
+    }
 }
 
 /// Does a block contain return / break / continue (not inside nested loops for the latter)?
@@ -302,6 +331,7 @@ impl Front {
     // ---------------------------------------------------------------- module
 
     fn module(&mut self, body: &[AStmt]) -> Res<()> {
+        let mut stub_imports: Vec<(String, Vec<String>, u32)> = Vec::new();
         let mut main_body: Vec<&AStmt> = Vec::new();
         let mut fdefs: Vec<&ast::StmtFunctionDef> = Vec::new();
         let mut cdefs: Vec<&ast::StmtClassDef> = Vec::new();
@@ -328,11 +358,14 @@ impl Front {
                                 self.imports.insert(a.name.id.to_string());
                             }
                         }
+                        m if m.starts_with("rust.") => {
+                            stub_imports.push((m[5..].to_string(), i.names.iter().map(|a| a.name.id.to_string()).collect::<Vec<_>>(), self.line(s)));
+                        }
                         // ownership annotations
                         "rust" => {
                             for a in &i.names {
                                 let n = a.name.id.as_str();
-                                if !["Ref", "Mut", "Own"].contains(&n) {
+                                if !["Ref", "Mut", "Own", "inline"].contains(&n) {
                                     return err(self.line(s), format!("`rust.{}` is not available", n));
                                 }
                                 self.imports.insert(n.to_string());
@@ -393,6 +426,7 @@ impl Front {
                 subs: vec![],
                 dispatch: vec![],
                 exc: None,
+                ext: None,
             });
         }
         for d in &cdefs {
@@ -436,6 +470,9 @@ impl Front {
                 return err(line, "constants must be int, float, bool or str");
             }
             self.p.consts.push(Const { name, value: e });
+        }
+        for (krate, names, line) in stub_imports {
+            self.load_stub(&krate, &names, line)?;
         }
         for d in &fdefs {
             if self.funcs.contains_key(d.name.id.as_str()) || self.classes.contains_key(d.name.id.as_str()) {
@@ -487,6 +524,114 @@ impl Front {
         Ok(())
     }
 
+    /// `from rust.<crate> import A, b`: declarations of `<crate>.pyi`.
+    fn load_stub(&mut self, krate: &str, names: &[String], line: u32) -> Res<()> {
+        let file = format!("{}.pyi", krate);
+        let Some(path) = self.stub_dirs.iter().map(|d| d.join(&file)).find(|p| p.exists()) else {
+            return err(line, format!("no stub for crate `{}`", krate))
+                .map_err(|e| e.hint(format!("write stubs/{} (see `py2rs stub {}`)", file, krate)));
+        };
+        let text = std::fs::read_to_string(&path).map_err(|e| Error::new(line, e.to_string()))?;
+        let dep = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("# crate:"))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_else(|| format!("{} = \"*\"", krate));
+        if !self.p.crates.contains(&dep) {
+            self.p.crates.push(dep);
+        }
+        let module = ruff_python_parser::parse_module(&text)
+            .map_err(|e| Error::new(line, format!("{}: {}", path.display(), e.error)))?
+            .into_syntax();
+        // line numbers in errors refer to the stub
+        let saved_lines = std::mem::replace(&mut self.lines, LineIndex::from_source_text(&text));
+        self.in_stub = Some(krate.to_string());
+        let r = self.stub_items(krate, &module.body, names);
+        self.in_stub = None;
+        self.lines = saved_lines;
+        r.map_err(|e| Error::new(line, format!("in {}: line {}: {}", path.display(), e.line, e.msg)))
+    }
+
+    fn stub_items(&mut self, krate: &str, body: &[AStmt], names: &[String]) -> Res<()> {
+        for s in body {
+            match s {
+                AStmt::ClassDef(d) => {
+                    let name = d.name.id.to_string();
+                    let mut path = format!("{}::{}", krate, name);
+                    for dec in &d.decorator_list {
+                        if let AExpr::Call(c) = &dec.expression {
+                            if let (AExpr::Name(n), Some(AExpr::StringLiteral(l))) = (&*c.func, c.arguments.args.first()) {
+                                if n.id.as_str() == "rust" {
+                                    path = l.value.to_str().to_string();
+                                }
+                            }
+                        }
+                    }
+                    let cid = self.p.classes.len();
+                    self.p.classes.push(Class {
+                        name: name.clone(),
+                        line: self.line(d),
+                        fields: vec![],
+                        dataclass: false,
+                        frozen: false,
+                        init: None,
+                        methods: vec![],
+                        base: None,
+                        subs: vec![],
+                        dispatch: vec![],
+                        exc: None,
+                        ext: Some(path),
+                    });
+                    // all classes of the stub are known while it is read
+                    self.classes.insert(name.clone(), cid);
+                }
+                AStmt::FunctionDef(_) | AStmt::ImportFrom(_) | AStmt::Import(_) | AStmt::Pass(_) => {}
+                _ if is_docstring(s) => {}
+                _ => return err(self.line(s), "stubs contain classes and functions"),
+            }
+        }
+        for s in body {
+            match s {
+                AStmt::ClassDef(d) => {
+                    let cid = self.p.classes.iter().rposition(|c| c.name == d.name.id.as_str()).unwrap();
+                    for m in &d.body {
+                        let AStmt::FunctionDef(f) = m else { continue };
+                        let fid = self.signature(f, Some(cid))?;
+                        let name = f.name.id.to_string();
+                        if name == "__init__" {
+                            self.p.funcs[fid].is_init = true;
+                            self.p.classes[cid].init = Some(fid);
+                        }
+                        self.p.classes[cid].methods.push((name, fid));
+                    }
+                }
+                AStmt::FunctionDef(f) => {
+                    let fid = self.signature(f, None)?;
+                    let name = f.name.id.to_string();
+                    if names.contains(&name) {
+                        self.funcs.insert(name, fid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for n in names {
+            if !self.classes.contains_key(n) && !self.funcs.contains_key(n) {
+                return err(0, format!("`{}` is not declared in the stub of `{}`", n, krate));
+            }
+        }
+        // only the imported names are visible to the program
+        for s in body {
+            if let AStmt::ClassDef(d) = s {
+                let n = d.name.id.to_string();
+                if !names.contains(&n) {
+                    self.classes.remove(&n);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn new_func(&mut self, name: &str, line: u32, class: Option<ClassId>) -> FuncId {
         self.p.funcs.push(Func {
             name: name.to_string(),
@@ -502,6 +647,7 @@ impl Front {
             shadows: vec![],
             dispatch: vec![],
             def_class: None,
+            ext: None,
         });
         self.p.funcs.len() - 1
     }
@@ -546,9 +692,18 @@ impl Front {
             return err(line, "generic functions are not supported");
         }
         let mut is_static = false;
+        let mut ext = self.in_stub.as_ref().map(|_| Extern::default());
         for dec in &d.decorator_list {
             match &dec.expression {
                 AExpr::Name(n) if n.id.as_str() == "staticmethod" && class.is_some() => is_static = true,
+                // stubs: @rust("path or {self}.template({0})"), @mut
+                AExpr::Name(n) if n.id.as_str() == "mut" && ext.is_some() => ext.as_mut().unwrap().self_mut = true,
+                AExpr::Call(c) if ext.is_some() && matches!(&*c.func, AExpr::Name(n) if n.id.as_str() == "rust") => {
+                    let Some(AExpr::StringLiteral(l)) = c.arguments.args.first() else {
+                        return err(self.line(dec), "@rust needs a string");
+                    };
+                    ext.as_mut().unwrap().rust = l.value.to_str().to_string();
+                }
                 _ => return err(self.line(dec), "decorators are not supported here")
                     .map_err(|e| e.hint("supported: @dataclass on classes, @staticmethod on methods")),
             }
@@ -594,6 +749,7 @@ impl Front {
                 },
                 _ => (&**a, None),
             };
+            let width = if self.in_stub.is_some() { width_of(a) } else { None };
             let ty = self.ann(a)?;
             if force.is_some() && ty.is_copy() {
                 return err(self.line(&p.parameter), "Ref / Mut / Own are for lists, dicts, sets, str and objects");
@@ -611,15 +767,39 @@ impl Front {
                 None => None,
             };
             let v = self.new_var(name, ty, VarKind::Param);
-            self.p.funcs[fid].params.push(Param { var: v, default, force });
+            self.p.funcs[fid].params.push(Param { var: v, default, force, width });
         }
         if class.is_some() && !is_static && self.p.funcs[fid].self_var.is_none() {
             return err(line, "methods need a `self` parameter");
         }
         self.p.funcs[fid].ret = match &d.returns {
+            // stubs: Result[T] raises ValueError on Err
+            Some(r) if self.in_stub.is_some() => {
+                let inner: &AExpr = match &**r {
+                    AExpr::Subscript(sub) if matches!(&*sub.value, AExpr::Name(n) if n.id.as_str() == "Result") => {
+                        ext.as_mut().unwrap().result = true;
+                        &sub.slice
+                    }
+                    x => x,
+                };
+                ext.as_mut().unwrap().ret_width = width_of(inner);
+                self.ann(inner)?
+            }
             Some(r) => self.ann(r)?,
             None => Ty::None,
         };
+        if let Some(mut x) = ext {
+            if x.rust.is_empty() {
+                let ty_name = class.and_then(|c| self.p.classes[c].ext.clone()).map(|p| p.rsplit("::").next().unwrap().to_string());
+                x.rust = match (ty_name, d.name.id.as_str()) {
+                    (Some(t), "__init__") => format!("{}::new", t),
+                    (Some(t), n) if is_static => format!("{}::{}", t, n),
+                    (Some(_), n) => n.to_string(),
+                    (None, n) => format!("{}::{}", self.in_stub.as_ref().unwrap(), n),
+                };
+            }
+            self.p.funcs[fid].ext = Some(x);
+        }
         self.p.funcs[fid].is_static = is_static;
         Ok(fid)
     }
@@ -835,7 +1015,7 @@ impl Front {
                 vars.push(sv);
                 for q in &orig.params {
                     vars.push(orig.vars[q.var].clone());
-                    params.push(Param { var: vars.len() - 1, default: q.default.clone(), force: q.force });
+                    params.push(Param { var: vars.len() - 1, default: q.default.clone(), force: q.force, width: q.width.clone() });
                 }
                 f.vars = vars;
                 f.params = params;
@@ -872,6 +1052,7 @@ impl Front {
                 "bool" => Ok(Ty::Bool),
                 "str" => Ok(Ty::Str),
                 "None" => Ok(Ty::None),
+                w if self.in_stub.is_some() && WIDTHS.contains(&w) => Ok(if w == "f32" { Ty::Float } else { Ty::Int }),
                 "list" | "List" | "dict" | "Dict" | "set" | "Set" | "tuple" | "Tuple" => {
                     err(line, format!("`{}` needs element types, e.g. list[int]", n.id))
                 }
@@ -2658,6 +2839,38 @@ impl Front {
 
     fn call(&mut self, c: &ast::ExprCall, want: Option<&Ty>, line: u32) -> Res<Expr> {
         let args = &c.arguments;
+        // inline("rust code") / inline[T]("rust expression"): raw Rust
+        let inline_ty = match &*c.func {
+            AExpr::Name(n) if n.id.as_str() == "inline" && self.imports.contains("inline") => Some(Ty::None),
+            AExpr::Subscript(sub) if matches!(&*sub.value, AExpr::Name(n) if n.id.as_str() == "inline" && self.imports.contains("inline")) => {
+                Some(self.ann(&sub.slice)?)
+            }
+            _ => None,
+        };
+        if let Some(t) = inline_ty {
+            let [AExpr::StringLiteral(code)] = &args.args[..] else {
+                return err(line, "inline() takes one string of Rust code");
+            };
+            let code = code.value.to_str().to_string();
+            // the variables it names count as used (and possibly modified)
+            let mut v = vec![self.mk(line, Ty::Str, ExprKind::Str(code.clone()))];
+            let words: Vec<String> = code
+                .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .filter(|w| !w.is_empty())
+                .map(String::from)
+                .collect();
+            let mut seen = HashSet::new();
+            for w in words {
+                if let Some(var) = self.lookup(&w) {
+                    if seen.insert(var) {
+                        let ty = self.var(var).ty.clone();
+                        v.push(self.mk(line, ty, ExprKind::Var(var)));
+                    }
+                }
+            }
+            let name: &'static str = if t == Ty::None { "inline" } else { "inline_expr" };
+            return Ok(self.mk(line, t, ExprKind::Builtin(name, v)));
+        }
         if args.args.iter().any(|a| matches!(a, AExpr::Starred(_))) || args.keywords.iter().any(|k| k.arg.is_none()) {
             return err(line, "`*args` / `**kwargs` in calls are not supported");
         }

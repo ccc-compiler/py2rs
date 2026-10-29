@@ -10,6 +10,7 @@ usage:
   py2rs emit  FILE.py              print the Rust program
   py2rs check FILE.py              check only (types, ownership)
   py2rs explain FILE.py            ownership decisions: parameter modes, references, copies
+  py2rs stub  CRATE[@VERSION]      write stubs/CRATE.pyi from the crate's rustdoc JSON
   py2rs build FILE.py [-o DIR]     write a Cargo project (default FILE_rs/) and build it
   py2rs run   FILE.py [ARGS...]    build (cached) and run
   py2rs test  [FILES|DIRS...]      differential test against CPython (default tests/)
@@ -24,6 +25,7 @@ fn main() {
         Some("emit") if args.len() == 2 => emit(&args[1]),
         Some("check") if args.len() == 2 => check(&args[1]),
         Some("explain") if args.len() == 2 => explain(&args[1]),
+        Some("stub") if args.len() == 2 => stub(&args[1]),
         Some("build") if args.len() >= 2 => {
             let out = match args.iter().position(|a| a == "-o") {
                 Some(i) if i + 1 < args.len() => Some(PathBuf::from(&args[i + 1])),
@@ -76,6 +78,45 @@ fn emit(file: &str) -> i32 {
         }
         None => 1,
     }
+}
+
+/// Document the crate with rustdoc's JSON output and write `stubs/CRATE.pyi`.
+fn stub(spec: &str) -> i32 {
+    let (krate, version) = spec.split_once('@').unwrap_or((spec, "*"));
+    let dep = format!("{} = \"{}\"", krate, version);
+    let dir = cache_target().join("stubgen").join(krate);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"stubgen\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{}\n\n[workspace]\n", dep),
+    )
+    .unwrap();
+    let out = Command::new("cargo")
+        .args(["doc", "--no-deps", "-p", krate])
+        .current_dir(&dir)
+        .env("RUSTDOCFLAGS", "-Z unstable-options --output-format json")
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("cargo");
+    if !out.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+        return 1;
+    }
+    let json = dir.join("target/doc").join(format!("{}.json", krate.replace('-', "_")));
+    let doc: serde_json::Value = match std::fs::read_to_string(&json).ok().and_then(|t| serde_json::from_str(&t).ok()) {
+        Some(d) => d,
+        None => {
+            eprintln!("no rustdoc JSON at {}", json.display());
+            return 1;
+        }
+    };
+    let text = py2rs::stubgen::stub(krate, &dep, &doc);
+    std::fs::create_dir_all("stubs").unwrap();
+    let path = Path::new("stubs").join(format!("{}.pyi", krate));
+    std::fs::write(&path, text).unwrap();
+    println!("{}", path.display());
+    0
 }
 
 fn explain(file: &str) -> i32 {
@@ -220,7 +261,16 @@ fn test(args: &[String]) -> i32 {
         }
     }
     let names: Vec<String> = bins.iter().map(|b| b.1.clone()).collect();
-    std::fs::write(dir.join("Cargo.toml"), project::cargo_toml("difftest", &names)).unwrap();
+    let mut crates: Vec<String> = vec![];
+    for n in &names {
+        let rust = std::fs::read_to_string(dir.join("src/bin").join(format!("{}.rs", n))).unwrap_or_default();
+        for c in project::crates_of(&rust) {
+            if !crates.contains(&c) {
+                crates.push(c);
+            }
+        }
+    }
+    std::fs::write(dir.join("Cargo.toml"), project::cargo_toml_with("difftest", &names, &crates)).unwrap();
     if !bins.is_empty() {
         let out = Command::new("cargo")
             .args(["build", "--release", "--quiet"])

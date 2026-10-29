@@ -174,7 +174,10 @@ pub fn analyze(p: &Program) -> Res<Own> {
                     };
                     modes.push((m, m == Mode::Owned && !escapes && !mutated));
                 }
-                let self_m = f.self_var.map(|sv| a.muts.iter().any(|m| m.root == sv) && !f.is_init).unwrap_or(false);
+                let self_m = match &f.ext {
+                    Some(x) => x.self_mut,
+                    None => f.self_var.map(|sv| a.muts.iter().any(|m| m.root == sv) && !f.is_init).unwrap_or(false),
+                };
                 let esc = f.self_var.map(|sv| a.escaped.contains(&sv)).unwrap_or(false);
                 let mv = a.accepted_mut_views();
                 (modes, self_m, a.ret_alias, (esc, mv))
@@ -822,6 +825,17 @@ impl<'a> Fn<'a> {
     }
 
     fn builtin(&mut self, name: &str, args: &[Expr], e: &Expr) {
+        if matches!(name, "inline" | "inline_expr") {
+            // raw Rust may modify what it names
+            for a in &args[1..] {
+                if let Some((r, p)) = self.place(a) {
+                    if !a.ty.is_copy() {
+                        self.mutate(r, p, true, e.line);
+                    }
+                }
+            }
+            return;
+        }
         if mutating(name) {
             if let Some((r, p)) = self.place(&args[0]) {
                 self.mutate(r, p, false, e.line);

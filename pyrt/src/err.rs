@@ -329,3 +329,16 @@ pub fn try_log(x: f64) -> PyResult<f64> {
     }
     Ok(x.ln())
 }
+
+/// A crate function's error as a Python ValueError.
+pub fn rust_err<E: std::fmt::Display>(e: E) -> PyErr {
+    PyErr::new(VALUE_ERROR, e.to_string())
+}
+
+/// A crate function's result where nothing catches its error.
+pub fn rust_ok<T, E: std::fmt::Display>(r: Result<T, E>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(e) => crate::raise("ValueError", &e.to_string()),
+    }
+}

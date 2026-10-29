@@ -9,7 +9,7 @@ rejection has a test in `tests/err/`.
 | M2 (v0.2) | Optional, inheritance, exceptions | done |
 | v0.3 | reliability: ~150-program corpus, definite assignment, random program fuzzer, CI | done |
 | v0.4 | mutable reference locals, moving out of narrowed values, `from rust import Ref, Mut, Own`, `py2rs explain`, usability batch | done |
-| v0.5 | `from rust.CRATE import X`: Cargo dependencies, rustdoc-JSON stubs, borrow / Result / Option mapping, `rust_inline` | |
+| v0.5 | `from rust.CRATE import X`: Cargo dependencies, rustdoc-JSON stubs, borrow / Result / Option mapping, `inline` | done |
 | v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time, os.path, files | |
 | v0.7 | `with`, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | |
 | v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | |

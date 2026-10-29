@@ -110,7 +110,10 @@ pub fn analyze(p: &Program) -> Res<Exc> {
         for fid in 0..n {
             let f = &p.funcs[fid];
             let mut m = HashSet::new();
-            if f.dispatch.is_empty() {
+            if f.ext.as_ref().is_some_and(|e| e.result) {
+                // a Rust Err becomes ValueError
+                m.insert("ValueError".to_string());
+            } else if f.dispatch.is_empty() {
                 block_may(p, &x, &f.body, &mut m);
             } else {
                 for (_, i) in &f.dispatch {
@@ -153,7 +156,8 @@ pub fn analyze(p: &Program) -> Res<Exc> {
         }
     }
     for fid in 0..n {
-        x.fallible[fid] = x.may[fid].iter().any(|k| caught(p, k, &x.need[fid]));
+        // extern functions are not generated: their call sites convert the Result
+        x.fallible[fid] = p.funcs[fid].ext.is_none() && x.may[fid].iter().any(|k| caught(p, k, &x.need[fid]));
     }
     // a dispatcher and its implementations agree
     loop {

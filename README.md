@@ -60,6 +60,40 @@ def keep(xs: Own[list[int]]) -> None: ...           # Vec<i64>
 
 An annotation the code contradicts (modifying a `Ref[...]`) is an error.
 
+## Rust crates
+
+`from rust.CRATE import Name` uses a Rust crate. Its declarations come from a stub,
+`CRATE.pyi`, looked up in `./stubs`, `PY2RS_STUBS` and the stubs shipped with py2rs
+(`stubs/regex.pyi`). The crate becomes a Cargo dependency of the generated project.
+
+```python
+from rust.regex import Regex
+
+date = Regex.new(r"(\d{4})-(\d{2})-(\d{2})")      # Result → ValueError when invalid
+print(date.replace_all("on 2024-05-17", "$3/$2/$1"))
+```
+
+```rust
+// py2rs-crate: regex = "1"
+use regex::Regex;
+let date = pyrt::rust_ok(Regex::new("(\\d{4})-(\\d{2})-(\\d{2})"));
+println!("{}", date.replace_all("on 2024-05-17", "$3/$2/$1").into_owned());
+```
+
+A stub is a Python file of typed declarations. Each one maps to a Rust path or to an
+expression template (`@rust("{self}.find({0}).map(|m| m.as_str().to_string())")`); `str`
+parameters are passed as `&str`, `usize` / `u32` / `f32` mark Rust number types, `Result[T]`
+turns `Err` into ValueError (a `try` can catch it), `@mut` marks `&mut self`.
+
+`py2rs stub CRATE[@VERSION]` writes `stubs/CRATE.pyi` from the crate's rustdoc JSON
+(functions and inherent methods whose types fit; the rest is listed as skipped). To run
+the same program under CPython, a stand-in module can sit next to the stub
+(`python/rust/regex.py` implements the regex stub with `re`).
+
+`from rust import inline` is the escape hatch: `inline("xs.sort_unstable();")` is a Rust
+statement, `inline[int]("n.count_ones() as i64")` a Rust expression (both do nothing
+under CPython); the variables they name count as used and modified.
+
 ## Testing
 
 `py2rs test [FILES|DIRS]` (default `tests/`) translates every program, builds them all

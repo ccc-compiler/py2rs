@@ -12,6 +12,7 @@ pub mod gen;
 pub mod ir;
 pub mod own;
 pub mod project;
+pub mod stubgen;
 
 pub use diag::Error;
 

@@ -308,6 +308,8 @@ pub struct Param {
     pub default: Option<Expr>,
     /// `Ref[T]` / `Mut[T]` / `Own[T]` from `from rust import ...`
     pub force: Option<Force>,
+    /// Rust number type of an extern parameter (`usize`, `u32`, ...)
+    pub width: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -336,6 +338,22 @@ pub struct Func {
     pub dispatch: Vec<(ClassId, FuncId)>,
     /// the class whose body contains the method's source (`super()` is relative to it)
     pub def_class: Option<ClassId>,
+    /// declared in a crate stub: implemented in Rust
+    pub ext: Option<Extern>,
+}
+
+/// A function of a Rust crate (from a stub file).
+#[derive(Clone, Debug, Default)]
+pub struct Extern {
+    /// Rust path (`Regex::new`), method name, or an expression template with
+    /// `{self}`, `{0}`, `{1}`, ...
+    pub rust: String,
+    /// returns `Result<T, E>`: an `Err` raises ValueError
+    pub result: bool,
+    /// takes `&mut self`
+    pub self_mut: bool,
+    /// the Rust integer / float type of the result (`usize`, `u32`, `f32`, ...)
+    pub ret_width: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -360,6 +378,8 @@ pub struct Class {
     pub dispatch: Vec<(String, FuncId)>,
     /// an exception class: (builtin exception it derives from)
     pub exc: Option<String>,
+    /// a Rust type from a crate stub (`regex::Regex`)
+    pub ext: Option<String>,
 }
 
 impl Class {
@@ -384,6 +404,8 @@ pub struct Program {
     pub consts: Vec<Const>,
     /// the synthetic `main` (module-level statements)
     pub main: FuncId,
+    /// crates used through stubs: Cargo dependency lines (`regex = "1"`)
+    pub crates: Vec<String>,
 }
 
 impl Program {
