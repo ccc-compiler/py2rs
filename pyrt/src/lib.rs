@@ -11,6 +11,7 @@ pub mod err;
 pub mod math;
 #[cfg(feature = "re")]
 pub mod re;
+pub mod files;
 pub mod spec;
 pub mod stdlib;
 pub mod strs;

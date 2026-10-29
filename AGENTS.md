@@ -98,3 +98,15 @@ Generated projects use edition 2024 (let chains).
   Cargo.toml). `own.stores`: a copy stored in a container is checked against later
   modifications of the source, or of anything reached through a path / deeply while the
   source is live.
+- v0.7: `front/dunder.rs` (`find_method`, `call_dunder`, `binary_dunder`,
+  `compare_dunder`, `unary_dunder`, `truth_dunder`; gen names them `op_*` in `ident`),
+  `Func.property` / `Func.cls` (classmethods: `cls` is put into `classes` while the body is
+  lowered), class attributes → `p.consts` via `class_attrs`. `front/nested.rs`:
+  `nested_def` saves the enclosing lowering state, computes captures from names
+  (`enclosing` stack of variable names, plus captures of nested functions it calls),
+  appends them as parameters (`Func.captures`; `nonlocal` ones `Force::Mut`, mode Mut in
+  `own::nonlocal`, assigned through `*x`), `capture_args` at calls; `func_value` /
+  `call_value` / `Ty::Func` (`Builtin("call_fn")`, gen `fn_arg_ty`). `front/matching.rs`
+  rewrites `match` into Python `if` source (`parse_at` relocates parsed snippets to the
+  case's range; guards get bound names substituted). Files: `Ty::File`,
+  `pyrt/src/files.rs`, `with` lowers to assignment + body + `file.close`.

@@ -17,6 +17,10 @@ const KEYWORDS: &[&str] = &[
 ];
 
 pub fn ident(n: &str) -> String {
+    // operator methods: `__add__` → `op_add`
+    if n.len() > 4 && n.starts_with("__") && n.ends_with("__") && !matches!(n, "__init__" | "__str__" | "__repr__") {
+        return format!("op_{}", &n[2..n.len() - 2]);
+    }
     if KEYWORDS.contains(&n) {
         format!("r#{}", n)
     } else if n == "Self" || n == "self" {
@@ -80,6 +84,12 @@ pub fn rty(t: &Ty, p: &Program) -> String {
         Ty::Deque(t) => format!("VecDeque<{}>", rty(t, p)),
         Ty::Pattern(_) => "pyrt::re::Pattern".to_string(),
         Ty::Match(_) => "pyrt::re::Match".to_string(),
+        Ty::File => "pyrt::files::File".to_string(),
+        Ty::Func(ps, ret) => {
+            let ps: Vec<String> = ps.iter().map(|t| fn_arg_ty(t, p)).collect();
+            let r = if **ret == Ty::None { String::new() } else { format!(" -> {}", rty(ret, p)) };
+            format!("impl Fn({}){}", ps.join(", "), r)
+        }
         Ty::Tuple(ts) => {
             let v: Vec<String> = ts.iter().map(|t| rty(t, p)).collect();
             if v.len() == 1 {
@@ -213,6 +223,9 @@ pub fn mutating_builtin(n: &str) -> bool {
 /// Prefixes of the standard library builtins (`gen::stdlib`).
 const STD: &[&str] = &[
     "re.",
+    "file.",
+    "os.",
+    "open",
     "collections.", "deque.", "counter.", "heapq.", "bisect.", "itertools.", "functools.", "random.", "sys.", "time.",
     "json.",
 ];
@@ -595,7 +608,10 @@ fn gen_class(
     }
     let sname = struct_name(p, ci);
     let hashable = c.dataclass && c.frozen && c.subs.is_empty() && c.fields.iter().all(|f| hashable_ty(&f.ty, p));
-    let derives = if hashable {
+    let user_eq = c.method("__eq__");
+    let derives = if user_eq.is_some() {
+        "Clone, Debug"
+    } else if hashable {
         "Clone, Debug, PartialEq, Eq, Hash"
     } else if c.dataclass {
         "Clone, Debug, PartialEq"
@@ -609,6 +625,25 @@ fn gen_class(
         out += &format!("    pub {}: {},\n", ident(&f.name), t);
     }
     out += "}\n\n";
+    // `==` (also in `in`, `list.index`, ...) and sorting use the class's own methods
+    let other = |fid: FuncId| if o.params[fid].first() == Some(&Mode::Owned) { "other.clone()" } else { "other" };
+    if let Some(f) = user_eq {
+        out += &format!(
+            "impl PartialEq for {0} {{\n    fn eq(&self, other: &Self) -> bool {{\n        self.op_eq({1})\n    }}\n}}\n\n",
+            sname,
+            other(f)
+        );
+    }
+    if let Some(f) = c.method("__lt__") {
+        let o2 = other(f);
+        let back = if o2 == "other" { "self" } else { "self.clone()" };
+        out += &format!(
+            "impl pyrt::PyOrd for {0} {{\n    fn py_cmp(&self, other: &Self) -> std::cmp::Ordering {{\n        \
+             if self.op_lt({1}) {{\n            std::cmp::Ordering::Less\n        }} else if other.op_lt({2}) {{\n            \
+             std::cmp::Ordering::Greater\n        }} else {{\n            std::cmp::Ordering::Equal\n        }}\n    }}\n}}\n\n",
+            sname, o2, back
+        );
+    }
     let methods: Vec<FuncId> = c.methods.iter().map(|(_, f)| *f).collect();
     if !methods.is_empty() {
         out += &format!("impl {} {{\n", sname);
@@ -1561,7 +1596,12 @@ impl<'a> FGen<'a> {
             StmtKind::AugVar(v, op, e) => {
                 let name = self.name(*v);
                 let t = self.f.vars[*v].ty.clone();
-                let target = r(name.clone(), Kind::Place, ATOM);
+                // a `nonlocal` variable is a `&mut` parameter
+                let target = if self.kinds.get(v) == Some(&Kind::Mut) {
+                    r(format!("*{}", name), Kind::Place, UNARY)
+                } else {
+                    r(name.clone(), Kind::Place, ATOM)
+                };
                 let line = self.aug_code(&target, &t, *op, e)?;
                 out.push_str(&format!("{}{}\n", ind, line));
             }
@@ -1921,6 +1961,11 @@ impl<'a> FGen<'a> {
                     let val = self.owned(v)?;
                     out.push_str(&format!("{}let _ = {};\n", ind, val));
                 }
+            }
+            // a `nonlocal` variable: the caller's, through `&mut`
+            Target::Var(w) if self.kinds.get(w) == Some(&Kind::Mut) && self.f.vars[*w].kind == VarKind::Param => {
+                let val = self.owned(v)?;
+                out.push_str(&format!("{}*{} = {};\n", ind, self.name(*w), val));
             }
             Target::Var(w) if self.o.mut_views[self.fid].contains(w) => {
                 // a mutable reference into a container
@@ -2710,6 +2755,35 @@ impl<'a> FGen<'a> {
             K::Comp(c) => self.comp(c, &e.ty)?,
             K::FStr(parts) => self.fstring(parts)?,
             K::Builtin(name, args) => self.builtin(name, args, e)?,
+            K::Lambda(ps, body) if matches!(e.ty, Ty::Func(..)) => {
+                // `square` itself when the lambda only forwards to a function that
+                // takes its arguments the way a Callable passes them
+                if let K::Call(fid, args) = &body.kind {
+                    let f = &self.p.funcs[*fid];
+                    let same = args.len() == ps.len()
+                        && args.iter().zip(ps).all(|(a, p)| matches!(a.kind, K::Var(v) if v == *p))
+                        && f.params.iter().enumerate().all(|(i, q)| {
+                            let m = self.o.params[*fid][i];
+                            if f.vars[q.var].ty.is_copy() { m == Mode::Copy } else { m == Mode::Ref }
+                        })
+                        && !self.x.fallible[*fid]
+                        && f.class.is_none()
+                        && !f.cache;
+                    if same {
+                        let name = if f.name == "main" { "py_main".to_string() } else { ident(&f.name) };
+                        return Ok(r(name, Kind::Val, ATOM));
+                    }
+                }
+                // a closure: Copy arguments by value, others by reference (`fn_arg_ty`)
+                let mut pats = vec![];
+                for v in ps {
+                    let t = self.f.vars[*v].ty.clone();
+                    self.kinds.insert(*v, if t.is_copy() { Kind::Place } else { Kind::Ref });
+                    pats.push(format!("{}: {}", self.name(*v), fn_arg_ty(&t, self.p)));
+                }
+                let b = self.owned(body)?;
+                r(format!("|{}| {}", pats.join(", "), b), Kind::Val, LOW)
+            }
             K::Lambda(..) => return err(e.line, "lambda outside sort/min/max"),
             K::Iter(it) => {
                 let (code, item) = self.iter_code(it, false, false)?;
@@ -4050,6 +4124,14 @@ impl<'a> FGen<'a> {
                 }
             }
             n if n.starts_with("math.") => self.math(&n[5..], a)?,
+            "call_fn" => {
+                let f = self.ex(&a[0])?;
+                let mut xs = vec![];
+                for x in &a[1..] {
+                    xs.push(if x.ty.is_copy() { self.val(x)?.code } else { self.borrow(x)? });
+                }
+                v(format!("{}({})", par(&f, ATOM), xs.join(", ")))
+            }
             n if STD.iter().any(|m| n.starts_with(m)) => self.std_builtin(n, a, e)?,
             n if n.starts_with("list.") => self.list_method(&n[5..], a, e)?,
             n if n.starts_with("dict.") => self.dict_method(&n[5..], a, e)?,
@@ -4740,4 +4822,14 @@ fn stmt_has_builtin(s: &Stmt, name: &str) -> bool {
     let mut found = false;
     stmt_exprs(s, &mut |e| ex(e, name, &mut found));
     found || s.blocks().iter().any(|b| b.iter().any(|x| stmt_has_builtin(x, name)))
+}
+
+/// How a `Callable` takes an argument: Copy values by value, others by reference.
+fn fn_arg_ty(t: &Ty, p: &Program) -> String {
+    match t {
+        t if t.is_copy() => rty(t, p),
+        Ty::Str => "&str".into(),
+        Ty::List(e) => format!("&[{}]", rty(e, p)),
+        t => format!("&{}", rty(t, p)),
+    }
 }

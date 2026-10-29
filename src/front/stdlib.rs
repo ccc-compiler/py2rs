@@ -7,7 +7,7 @@ use super::*;
 
 /// Modules that `import M` / `from M import x` accept.
 pub const MODULES: &[&str] =
-    &["math", "sys", "collections", "heapq", "bisect", "itertools", "functools", "random", "time", "json", "re"];
+    &["math", "sys", "collections", "heapq", "bisect", "itertools", "functools", "random", "time", "json", "re", "os"];
 
 /// The value type a `defaultdict` factory produces.
 fn factory_ty(name: &str) -> Option<Ty> {
@@ -399,6 +399,23 @@ impl Front {
                 self.jsonable(&x.ty, line)?;
                 (Ty::Str, name, vec![x])
             }
+            "os.path.exists" | "os.remove" => {
+                n_kw(self, &[])?;
+                self.nargs(args, 1, 1, q, line)?;
+                let p = self.arg(args, 0, &Ty::Str, "path")?;
+                (if q == "os.remove" { Ty::None } else { Ty::Bool }, name, vec![p])
+            }
+            "os.path.join" => {
+                n_kw(self, &[])?;
+                if args.args.is_empty() {
+                    return err(line, "os.path.join() needs a path");
+                }
+                let mut v = vec![];
+                for i in 0..args.args.len() {
+                    v.push(self.arg(args, i, &Ty::Str, "path")?);
+                }
+                (Ty::Str, name, v)
+            }
             "json.loads" => return err(line, "json.loads() is outside the typed subset (its result has no static type)"),
             _ => return err(line, format!("`{}` is not supported", q)),
         };
@@ -436,6 +453,28 @@ impl Front {
         Ok(Some(true))
     }
 
+    /// `open(path, mode="r", encoding="utf-8")`
+    pub(super) fn open_call(&mut self, args: &ast::Arguments, line: u32) -> Res<Expr> {
+        let kws = self.kw(args, &["mode", "encoding"], line)?;
+        self.nargs(args, 1, 2, "open", line)?;
+        let p = self.arg(args, 0, &Ty::Str, "path")?;
+        let mode = match args.args.get(1).or_else(|| kws.get("mode").copied()) {
+            Some(AExpr::StringLiteral(s)) => s.value.to_str().to_string(),
+            Some(_) => return err(line, "the mode must be a string literal"),
+            None => "r".into(),
+        };
+        if !["r", "w", "a", "rt", "wt", "at"].contains(&mode.as_str()) {
+            return err(line, format!("mode `{}` is not supported (text files: r, w, a)", mode));
+        }
+        match kws.get("encoding") {
+            Some(AExpr::StringLiteral(s)) if ["utf-8", "utf8", "UTF-8"].contains(&s.value.to_str()) => {}
+            Some(_) => return err(line, "only encoding=\"utf-8\" is supported"),
+            None => {}
+        }
+        let m = self.mk(line, Ty::Str, ExprKind::Str(mode));
+        Ok(self.mk(line, Ty::File, ExprKind::Builtin("open", vec![p, m])))
+    }
+
     fn jsonable(&self, t: &Ty, line: u32) -> Res<()> {
         match self.norm(t) {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Str => Ok(()),
@@ -463,6 +502,32 @@ impl Front {
         };
         match &rt {
             Ty::Pattern(_) | Ty::Match(_) => self.re_method(recv, m, args, line).map(Ok),
+            Ty::File => {
+                self.kw(args, &[], line)?;
+                let (n, t, v): (&'static str, Ty, Vec<Expr>) = match m {
+                    "read" | "readline" | "readlines" | "close" => {
+                        self.nargs(args, 0, 0, m, line)?;
+                        match m {
+                            "read" => ("file.read", Ty::Str, vec![]),
+                            "readline" => ("file.readline", Ty::Str, vec![]),
+                            "readlines" => ("file.readlines", Ty::list(Ty::Str), vec![]),
+                            _ => ("file.close", Ty::None, vec![]),
+                        }
+                    }
+                    "write" => {
+                        self.nargs(args, 1, 1, m, line)?;
+                        let s = self.arg(args, 0, &Ty::Str, "write() argument")?;
+                        ("file.write", Ty::Int, vec![s])
+                    }
+                    "writelines" => {
+                        self.nargs(args, 1, 1, m, line)?;
+                        let s = self.arg(args, 0, &Ty::list(Ty::Str), "writelines() argument")?;
+                        ("file.writelines", Ty::None, vec![s])
+                    }
+                    _ => return err(line, format!("files have no method `{}` in the subset", m)),
+                };
+                b(self, n, t, v, recv)
+            }
             Ty::Deque(et) => {
                 let et = (**et).clone();
                 self.kw(args, &[], line)?;

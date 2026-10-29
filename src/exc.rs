@@ -28,6 +28,7 @@ pub fn parent(p: &Program, k: &str) -> Option<String> {
         "ZeroDivisionError" | "OverflowError" => "ArithmeticError",
         "IndexError" | "KeyError" => "LookupError",
         "NotImplementedError" => "RuntimeError",
+        "FileNotFoundError" | "PermissionError" | "IsADirectoryError" => "OSError",
         k if EXCEPTIONS.contains(&k) => "Exception",
         k => {
             let c = p.classes.iter().find(|c| c.name == k)?;
@@ -96,6 +97,8 @@ pub fn op_kinds(e: &Expr) -> (Vec<&'static str>, Vec<&'static str>) {
                 (vec![], vec!["ValueError"])
             }
             "input" => (vec![], vec!["EOFError"]),
+            "open" | "os.remove" => (vec![], vec!["FileNotFoundError", "PermissionError", "IsADirectoryError", "OSError"]),
+            "file.read" | "file.readline" | "file.readlines" | "file.write" | "file.writelines" => (vec![], vec!["ValueError"]),
             "list.swap" | "heapq.heappop" | "heapq.heapreplace" | "deque.pop" | "deque.popleft" | "random.choice" => {
                 (vec![], vec!["IndexError"])
             }

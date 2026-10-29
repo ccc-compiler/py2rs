@@ -1,6 +1,6 @@
 [package]
 name = "py2rs"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Translate a typed subset of Python into readable Rust"
 license = "MIT"

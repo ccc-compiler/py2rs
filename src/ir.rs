@@ -22,6 +22,10 @@ pub enum Ty {
     Pattern(usize),
     /// `re.Match` with n groups
     Match(usize),
+    /// `Callable[[A, B], R]`
+    Func(Vec<Ty>, Box<Ty>),
+    /// a text file from `open`
+    File,
     Set(Box<Ty>),
     Tuple(Vec<Ty>),
     Class(ClassId),
@@ -91,6 +95,17 @@ impl fmt::Display for TyName<'_> {
             Ty::Deque(t) => write!(f, "deque[{}]", TyName(t, p)),
             Ty::Pattern(_) => write!(f, "re.Pattern"),
             Ty::Match(_) => write!(f, "re.Match"),
+            Ty::File => write!(f, "TextIO"),
+            Ty::Func(ps, r) => {
+                write!(f, "Callable[[")?;
+                for (i, t) in ps.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", TyName(t, p))?;
+                }
+                write!(f, "], {}]", TyName(r, p))
+            }
             Ty::Tuple(ts) => {
                 write!(f, "tuple[")?;
                 for (i, t) in ts.iter().enumerate() {
@@ -354,6 +369,12 @@ pub struct Func {
     pub is_static: bool,
     /// `@functools.cache`: results remembered by argument
     pub cache: bool,
+    /// `@property`: read as `obj.name`
+    pub property: bool,
+    /// `@classmethod`: the name of its class parameter (`cls`)
+    pub cls: Option<String>,
+    /// a nested function: the enclosing variables it uses, passed as its last parameters
+    pub captures: Vec<String>,
     /// loop variables that reuse the name of a local: (loop var, local)
     pub shadows: Vec<(VarId, VarId)>,
     /// a method of a class with subclasses: the implementation of each class

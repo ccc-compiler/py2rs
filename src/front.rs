@@ -10,6 +10,9 @@ use ruff_text_size::Ranged;
 use crate::diag::{err, Error, Res};
 use crate::ir::*;
 
+mod dunder;
+mod matching;
+mod nested;
 mod re;
 mod stdlib;
 
@@ -39,6 +42,7 @@ pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
     let module = parsed.into_syntax();
     let mut f = Front {
         lines: LineIndex::from_source_text(src),
+        src: src.to_string(),
         p: Program::default(),
         funcs: HashMap::new(),
         classes: HashMap::new(),
@@ -47,6 +51,9 @@ pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
         imports: HashSet::new(),
         from_names: HashMap::new(),
         loop_keys: HashMap::new(),
+        class_attrs: HashMap::new(),
+        enclosing: vec![],
+        local_funcs: vec![],
         tvars: Vec::new(),
         next_id: 0,
         cur: 0,
@@ -65,6 +72,8 @@ pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
 
 struct Front {
     lines: LineIndex,
+    /// the source text (`match` patterns are rewritten as Python)
+    src: String,
     p: Program,
     funcs: HashMap<String, FuncId>,
     classes: HashMap<String, ClassId>,
@@ -75,6 +84,12 @@ struct Front {
     from_names: HashMap<String, String>,
     /// loop variable → the dict whose keys it runs over
     loop_keys: HashMap<VarId, VarId>,
+    /// class attributes (constants): (class, name) → `p.consts` index
+    class_attrs: HashMap<(ClassId, String), usize>,
+    /// variable names of the functions being lowered (for nested functions' captures)
+    enclosing: Vec<HashSet<String>>,
+    /// nested functions defined in the functions being lowered: (name, the `funcs` entry it hides)
+    local_funcs: Vec<Vec<(String, Option<FuncId>)>>,
     tvars: Vec<Option<Ty>>,
     next_id: u32,
     cur: FuncId,
@@ -142,6 +157,7 @@ pub const EXCEPTIONS: &[&str] = &[
     "Exception", "ValueError", "TypeError", "IndexError", "KeyError", "RuntimeError",
     "ZeroDivisionError", "AssertionError", "NotImplementedError", "ArithmeticError",
     "OverflowError", "LookupError", "StopIteration", "AttributeError", "EOFError", "BaseException", "NameError",
+    "OSError", "FileNotFoundError", "PermissionError", "IsADirectoryError",
 ];
 
 fn snake_name(n: &str) -> String {
@@ -282,6 +298,8 @@ impl Front {
             Ty::Dict(k, v, d) => Ty::Dict(Box::new(self.norm(k)), Box::new(self.norm(v)), *d),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.norm(t)).collect()),
             Ty::Optional(a) => Ty::opt(self.norm(a)),
+            Ty::Deque(a) => Ty::Deque(Box::new(self.norm(a))),
+            Ty::Func(ps, r) => Ty::Func(ps.iter().map(|t| self.norm(t)).collect(), Box::new(self.norm(r))),
             _ => t.clone(),
         }
     }
@@ -302,6 +320,10 @@ impl Front {
             (Ty::Dict(k1, v1, d1), Ty::Dict(k2, v2, d2)) => d1 == d2 && self.unify(k1, k2) && self.unify(v1, v2),
             (Ty::Tuple(x), Ty::Tuple(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| self.unify(p, q))
+            }
+            (Ty::Deque(x), Ty::Deque(y)) => self.unify(x, y),
+            (Ty::Func(p1, r1), Ty::Func(p2, r2)) => {
+                p1.len() == p2.len() && p1.iter().zip(p2.iter()).all(|(p, q)| self.unify(p, q)) && self.unify(r1, r2)
             }
             _ => a == b,
         }
@@ -664,6 +686,9 @@ impl Front {
             is_init: false,
             is_static: false,
             cache: false,
+            property: false,
+            cls: None,
+            captures: vec![],
             shadows: vec![],
             dispatch: vec![],
             def_class: None,
@@ -713,6 +738,8 @@ impl Front {
         }
         let mut is_static = false;
         let mut cache = false;
+        let mut property = false;
+        let mut classmethod = false;
         let mut ext = self.in_stub.as_ref().map(|_| Extern::default());
         for dec in &d.decorator_list {
             if let Some(c) = self.cache_decorator(&dec.expression, class.is_some(), self.line(dec))? {
@@ -721,6 +748,15 @@ impl Front {
             }
             match &dec.expression {
                 AExpr::Name(n) if n.id.as_str() == "staticmethod" && class.is_some() => is_static = true,
+                AExpr::Name(n) if n.id.as_str() == "property" && class.is_some() => property = true,
+                AExpr::Name(n) if n.id.as_str() == "classmethod" && class.is_some() => {
+                    is_static = true;
+                    classmethod = true;
+                }
+                AExpr::Attribute(a) if class.is_some() && matches!(a.attr.id.as_str(), "setter" | "deleter") => {
+                    return err(self.line(dec), "property setters are not supported")
+                        .map_err(|e| e.hint("use a method: set_x(self, v)"));
+                }
                 // stubs: @rust("path or {self}.template({0})"), @mut
                 AExpr::Name(n) if n.id.as_str() == "mut" && ext.is_some() => ext.as_mut().unwrap().self_mut = true,
                 AExpr::Call(c) if ext.is_some() && matches!(&*c.func, AExpr::Name(n) if n.id.as_str() == "rust") => {
@@ -730,7 +766,7 @@ impl Front {
                     ext.as_mut().unwrap().rust = l.value.to_str().to_string();
                 }
                 _ => return err(self.line(dec), "decorators are not supported here")
-                    .map_err(|e| e.hint("supported: @dataclass on classes, @staticmethod on methods, @functools.cache on functions")),
+                    .map_err(|e| e.hint("supported: @dataclass on classes, @staticmethod / @classmethod / @property on methods, @functools.cache on functions")),
             }
         }
         let fid = self.new_func(d.name.id.as_str(), line, class);
@@ -745,6 +781,11 @@ impl Front {
         let mut first = true;
         for p in all {
             let name = p.parameter.name.id.as_str();
+            if first && classmethod {
+                first = false;
+                self.p.funcs[fid].cls = Some(name.to_string());
+                continue;
+            }
             if first && class.is_some() && !is_static {
                 first = false;
                 if name != "self" {
@@ -827,6 +868,12 @@ impl Front {
             self.p.funcs[fid].ext = Some(x);
         }
         self.p.funcs[fid].is_static = is_static;
+        if property {
+            if !self.p.funcs[fid].params.is_empty() || self.p.funcs[fid].ret == Ty::None {
+                return err(line, "a property takes only self and returns a value");
+            }
+            self.p.funcs[fid].property = true;
+        }
         if cache {
             for q in self.p.funcs[fid].params.clone() {
                 let t = self.p.funcs[fid].vars[q.var].ty.clone();
@@ -874,6 +921,43 @@ impl Front {
         }
         let main = self.p.main;
         for s in &d.body {
+            // `count = 0` / `X: ClassVar[int] = 0`: a class attribute
+            let attr = match s {
+                AStmt::Assign(a) if a.targets.len() == 1 => match &a.targets[0] {
+                    AExpr::Name(n) => Some((n.id.as_str(), None, &*a.value)),
+                    _ => None,
+                },
+                AStmt::AnnAssign(a) => match (&*a.target, &*a.annotation, &a.value) {
+                    (AExpr::Name(n), AExpr::Subscript(sub), Some(v)) if matches!(&*sub.value, AExpr::Name(c) if c.id.as_str() == "ClassVar") => {
+                        Some((n.id.as_str(), Some(&*sub.slice), &**v))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((name, ann, value)) = attr {
+                let line = self.line(s);
+                if !is_const_expr(value, &self.consts) {
+                    return err(line, "class attributes must be constants (literals)")
+                        .map_err(|e| e.hint("a shared mutable class attribute is global state; keep it in an object"));
+                }
+                self.enter(main);
+                let want = match ann {
+                    Some(a) => Some(self.ann(a)?),
+                    None => None,
+                };
+                let mut e = self.expr(value, want.as_ref())?;
+                if let Some(w) = &want {
+                    e = self.coerce(e, w, "class attribute")?;
+                }
+                if !matches!(self.norm(&e.ty), Ty::Int | Ty::Float | Ty::Bool | Ty::Str) {
+                    return err(line, "class attributes must be int, float, bool or str");
+                }
+                let cname = format!("{}_{}", snake_name(&d.name.id).to_uppercase(), name.to_uppercase());
+                self.class_attrs.insert((cid, name.to_string()), self.p.consts.len());
+                self.p.consts.push(Const { name: cname, value: e });
+                continue;
+            }
             match s {
                 AStmt::AnnAssign(a) => {
                     let AExpr::Name(n) = &*a.target else {
@@ -931,7 +1015,10 @@ impl Front {
                         self.p.funcs[fid].is_init = true;
                         self.p.classes[cid].init = Some(fid);
                     } else if name.starts_with("__") && !["__str__", "__repr__"].contains(&name) {
-                        return err(self.line(f), format!("special method `{}` is not supported yet", name));
+                        if !dunder::SUPPORTED.contains(&name) {
+                            return err(self.line(f), format!("special method `{}` is not supported", name));
+                        }
+                        self.check_dunder(cid, fid, self.line(f))?;
                     }
                     self.p.classes[cid].methods.push((name.to_string(), fid));
                     bodies.push((fid, f));
@@ -1062,13 +1149,42 @@ impl Front {
 
     fn body(&mut self, fid: FuncId, body: &[AStmt]) -> Res<()> {
         self.enter(fid);
+        // `cls` in a classmethod names the class it is compiled for
+        let cls = match (&self.p.funcs[fid].cls, self.p.funcs[fid].class) {
+            (Some(n), Some(c)) => Some((n.clone(), self.classes.insert(n.clone(), c))),
+            _ => None,
+        };
+        let mut names = HashMap::new();
+        assigned_names(body, &mut names);
+        let mut names: HashSet<String> = names.into_keys().collect();
+        names.extend(self.p.funcs[fid].vars.iter().filter(|v| matches!(v.kind, VarKind::Param | VarKind::SelfParam)).map(|v| v.name.clone()));
+        self.enclosing.push(names);
+        self.local_funcs.push(vec![]);
         let mut out = Vec::new();
+        let mut res = Ok(());
         for s in body {
             if is_docstring(s) {
                 continue;
             }
-            self.stmt(s, &mut out)?;
+            res = self.stmt(s, &mut out);
+            if res.is_err() {
+                break;
+            }
         }
+        self.enclosing.pop();
+        for (n, old) in self.local_funcs.pop().unwrap_or_default().into_iter().rev() {
+            match old {
+                Some(o) => self.funcs.insert(n, o),
+                None => self.funcs.remove(&n),
+            };
+        }
+        if let Some((n, old)) = cls {
+            match old {
+                Some(o) => self.classes.insert(n, o),
+                None => self.classes.remove(&n),
+            };
+        }
+        res?;
         self.p.funcs[fid].body = out;
         Ok(())
     }
@@ -1126,6 +1242,14 @@ impl Front {
                         Ok(Ty::Tuple(args.iter().map(|a| self.ann(a)).collect::<Res<_>>()?))
                     }
                     ("Optional", 1) => self.optional(args[0], line),
+                    ("Callable", 2) => {
+                        let AExpr::List(ps) = args[0] else {
+                            return err(line, "Callable[[A, B], R] needs the parameter types in a list");
+                        };
+                        let ps = ps.elts.iter().map(|a| self.ann(a)).collect::<Res<Vec<_>>>()?;
+                        let r = self.ann(args[1])?;
+                        Ok(Ty::Func(ps, Box::new(r)))
+                    }
                     ("Union", 2) => {
                         let (a, b) = (args[0], args[1]);
                         if matches!(b, AExpr::NoneLiteral(_)) {
@@ -1500,11 +1624,24 @@ impl Front {
                 }
                 return Ok(());
             }
-            AStmt::Global(_) | AStmt::Nonlocal(_) => {
+            AStmt::Nonlocal(n) => {
+                let f = &self.p.funcs[self.cur];
+                let ok = n.names.iter().all(|x| {
+                    f.params.iter().any(|p| f.vars[p.var].name == x.id.as_str() && p.force == Some(Force::Mut))
+                });
+                if !ok {
+                    return err(line, "`nonlocal` names a variable of an enclosing function");
+                }
+                return Ok(());
+            }
+            AStmt::Global(_) => {
                 return err(line, "`global` / `nonlocal` are outside the subset")
                     .map_err(|e| e.hint("pass the value as a parameter and return the new value"))
             }
-            AStmt::FunctionDef(_) => return err(line, "nested functions are not supported yet"),
+            AStmt::FunctionDef(d) => {
+                self.nested_def(d, line)?;
+                return Ok(());
+            }
             AStmt::ClassDef(_) => return err(line, "classes must be defined at module level"),
             AStmt::Try(t) => {
                 if t.is_star {
@@ -1566,8 +1703,39 @@ impl Front {
                 let fin = self.block(&t.finalbody)?;
                 StmtKind::Try(body, hs, orelse, fin)
             }
-            AStmt::With(_) => return err(line, "`with` is not supported yet"),
-            AStmt::Match(_) => return err(line, "`match` is not supported yet"),
+            AStmt::With(w) => {
+                if w.is_async {
+                    return err(line, "`async with` is not supported");
+                }
+                // `with open(p) as f:` → `f = open(p)`, the body, `f.close()`
+                let mut files = vec![];
+                for it in &w.items {
+                    let Some(AExpr::Name(n)) = it.optional_vars.as_deref() else {
+                        return err(line, "write `with open(...) as f:`");
+                    };
+                    self.assign(it.optional_vars.as_deref().unwrap(), None, Some(&it.context_expr), line, out)?;
+                    let v = self.lookup(n.id.as_str()).unwrap();
+                    if self.norm(&self.var(v).ty) != Ty::File {
+                        return err(line, "only `with open(...)` is supported");
+                    }
+                    files.push(v);
+                }
+                for s in &w.body {
+                    self.stmt(s, out)?;
+                }
+                for v in files.into_iter().rev() {
+                    let f = self.mk(line, Ty::File, ExprKind::Var(v));
+                    let c = self.mk(line, Ty::None, ExprKind::Builtin("file.close", vec![f]));
+                    out.push(self.stmt_(line, StmtKind::Expr(c)));
+                }
+                return Ok(());
+            }
+            AStmt::Match(m) => {
+                for s in self.lower_match(m, line)? {
+                    self.stmt(&s, out)?;
+                }
+                return Ok(());
+            }
             AStmt::Import(_) | AStmt::ImportFrom(_) => return err(line, "imports must be at module level"),
             _ => return err(line, "unsupported statement"),
         };
@@ -1677,6 +1845,18 @@ impl Front {
         if let (AExpr::Tuple(t), Some(AExpr::Tuple(v))) = (target, value) {
             if let Some(s) = self.swap(&t.elts, &v.elts, line)? {
                 out.push(s);
+                return Ok(());
+            }
+        }
+        // `obj[k] = v` → `obj.__setitem__(k, v)`
+        if let (AExpr::Subscript(s), Some(value)) = (target, value) {
+            let base = self.expr(&s.value, None)?;
+            if let Some(f) = self.find_method(&base.ty, "__setitem__") {
+                let pts: Vec<Ty> = self.p.funcs[f].params.iter().map(|p| self.p.funcs[f].vars[p.var].ty.clone()).collect();
+                let k = self.expr(&s.slice, pts.first())?;
+                let v = self.expr(value, pts.get(1))?;
+                let e = self.call_dunder(base, f, vec![k, v], line)?;
+                out.push(self.stmt_(line, StmtKind::Expr(e)));
                 return Ok(());
             }
         }
@@ -1863,6 +2043,16 @@ impl Front {
         let rhs = self.expr(&a.value, Some(&tt))?;
         // type of `t op rhs` must be the target's type
         let probe = self.binary(op, target.clone(), rhs, line)?;
+        if let ExprKind::Method(..) = probe.kind {
+            // an object's operator: `t = t.__op__(rhs)` (Python rebinds the target)
+            let rt = self.norm(&probe.ty);
+            if rt != tt {
+                return err(line, format!("`{}=` would change the type from {} to {}", opstr(op), self.tn(&tt), self.tn(&rt)));
+            }
+            let mut val = probe;
+            let t = self.target(&a.target, &tt, false, &mut val, line)?;
+            return Ok(StmtKind::Assign(t, val));
+        }
         let rt = self.norm(&probe.ty);
         if rt != tt {
             return err(line, format!("`{}=` would change the type from {} to {}", opstr(op), self.tn(&tt), self.tn(&rt)));
@@ -1925,6 +2115,11 @@ impl Front {
     }
 
     fn truth(&mut self, e: Expr) -> Res<Expr> {
+        let line = e.line;
+        let e = match self.truth_dunder(e, line)? {
+            Ok(x) => return Ok(x),
+            Err(e) => e,
+        };
         let t = self.norm(&e.ty);
         match t {
             Ty::Bool => Ok(e),
@@ -1988,6 +2183,15 @@ impl Front {
                 }
                 op => {
                     let x = self.expr(&u.operand, want)?;
+                    let m = match op {
+                        ast::UnaryOp::USub => "__neg__",
+                        ast::UnaryOp::UAdd => "__pos__",
+                        _ => "__invert__",
+                    };
+                    let x = match self.unary_dunder(x, m, line)? {
+                        Ok(e) => return Ok(e),
+                        Err(x) => x,
+                    };
                     let t = self.norm(&x.ty);
                     let (uo, ok) = match op {
                         ast::UnaryOp::USub => (UnOp::Neg, t.is_num()),
@@ -2120,6 +2324,20 @@ impl Front {
                 if let Some(q) = self.std_name(e) {
                     return self.std_value(&q, line);
                 }
+                // `C.attr`: a class attribute
+                if let AExpr::Name(n) = &*a.value {
+                    if self.lookup(n.id.as_str()).is_none() {
+                        if let Some(&c) = self.classes.get(n.id.as_str()) {
+                            return match self.class_attr(c, a.attr.id.as_str()) {
+                                Some(k) => {
+                                    let t = self.p.consts[k].value.ty.clone();
+                                    Ok(self.mk(line, t, K::Const(k)))
+                                }
+                                None => err(line, format!("class `{}` has no attribute `{}`", n.id, a.attr.id)),
+                            };
+                        }
+                    }
+                }
                 let obj = self.expr(&a.value, None)?;
                 match self.norm(&obj.ty) {
                     Ty::Class(c) | Ty::Obj(c) => {
@@ -2137,7 +2355,14 @@ impl Front {
                                 }
                             }
                             None => {
-                                return err(line, format!("`{}` has no field `{}`", self.p.classes[c].name, name))
+                                if let Some(f) = self.find_method(&obj.ty, name).filter(|f| self.p.funcs[*f].property) {
+                                    return self.call_dunder(obj, f, vec![], line);
+                                }
+                                if let Some(k) = self.class_attr(c, name) {
+                                    let t = self.p.consts[k].value.ty.clone();
+                                    return Ok(self.mk(line, t, K::Const(k)));
+                                }
+                                return err(line, format!("`{}` has no field `{}`", self.p.classes[c].name, name));
                             }
                         }
                     }
@@ -2146,7 +2371,19 @@ impl Front {
             }
             AExpr::Subscript(s) => self.subscript(s, line)?,
             AExpr::Call(c) => self.call(c, want, line)?,
-            AExpr::Lambda(_) => return err(line, "lambda is only supported as `key=` of sort/sorted/min/max"),
+            AExpr::Lambda(_) => match want.map(|w| self.norm(w)) {
+                Some(Ty::Func(ps, r)) => {
+                    let l = self.lambda(e, &ps)?;
+                    if !self.unify(&l.ty, &r) && *r != Ty::None {
+                        return err(line, format!("the lambda returns {}, not {}", self.tn(&l.ty), self.tn(&r)));
+                    }
+                    let mut l = l;
+                    l.ty = Ty::Func(ps, r);
+                    l
+                }
+                _ => return err(line, "a lambda needs a known type here: pass it to a Callable parameter or annotate the variable")
+                    .map_err(|e| e.hint("f: Callable[[int], int] = lambda x: x + 1")),
+            },
             AExpr::Named(_) => return err(line, "`:=` is not supported"),
             AExpr::Starred(_) => return err(line, "`*` unpacking is not supported"),
             AExpr::Yield(_) | AExpr::YieldFrom(_) => return err(line, "generators (`yield`) are not supported yet"),
@@ -2202,6 +2439,9 @@ impl Front {
                 return Ok(self.mk(line, t, ExprKind::Const(c)));
             }
         }
+        if let Some(&fid) = self.funcs.get(n) {
+            return self.func_value(fid, line);
+        }
         if self.funcs.contains_key(n) || self.classes.contains_key(n) {
             return err(line, format!("`{}` cannot be used as a value", n))
                 .map_err(|e| e.hint("functions and classes are not first-class values in the subset"));
@@ -2249,6 +2489,10 @@ impl Front {
 
     fn binary(&mut self, op: BinOp, l: Expr, r: Expr, line: u32) -> Res<Expr> {
         use BinOp::*;
+        let (l, r) = match self.binary_dunder(op, l, r, line)? {
+            Ok(e) => return Ok(e),
+            Err(x) => x,
+        };
         // an unknown element type (of an empty literal) takes the other operand's
         match (self.norm(&l.ty), self.norm(&r.ty)) {
             (Ty::Var(_), Ty::Var(_)) => {
@@ -2330,6 +2574,27 @@ impl Front {
             }
         }
         let first = self.expr(&c.operands[0], None)?;
+        if c.ops.len() == 1 && (self.is_obj(&first.ty) || matches!(c.ops[0], ast::CmpOp::In | ast::CmpOp::NotIn)) {
+            let b = self.expr(&c.operands[1], None)?;
+            let op = match c.ops[0] {
+                ast::CmpOp::Eq => Some(CmpOp::Eq),
+                ast::CmpOp::NotEq => Some(CmpOp::Ne),
+                ast::CmpOp::Lt => Some(CmpOp::Lt),
+                ast::CmpOp::LtE => Some(CmpOp::Le),
+                ast::CmpOp::Gt => Some(CmpOp::Gt),
+                ast::CmpOp::GtE => Some(CmpOp::Ge),
+                ast::CmpOp::In => Some(CmpOp::In),
+                ast::CmpOp::NotIn => Some(CmpOp::NotIn),
+                _ => None,
+            };
+            if let Some(op) = op {
+                if self.is_obj(&first.ty) || self.is_obj(&b.ty) {
+                    if let Ok(e) = self.compare_dunder(op, first.clone(), b, line)? {
+                        return Ok(e);
+                    }
+                }
+            }
+        }
         let mut prev_ty = self.norm(&first.ty);
         let mut first = first;
         let mut rest = Vec::new();
@@ -2420,6 +2685,7 @@ impl Front {
     fn orderable(&self, t: &Ty, line: u32) -> Res<()> {
         match self.norm(t) {
             Ty::Int | Ty::Float | Ty::Str | Ty::Bool => Ok(()),
+            Ty::Class(c) if self.p.classes[c].method("__lt__").is_some() => Ok(()),
             Ty::List(e) => self.orderable(&e, line),
             Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.orderable(t, line)),
             // elements of an empty literal: settled (as int) at the end
@@ -2430,6 +2696,11 @@ impl Front {
 
     fn subscript(&mut self, s: &ast::ExprSubscript, line: u32) -> Res<Expr> {
         let base = self.expr(&s.value, None)?;
+        if let Some(f) = self.find_method(&base.ty, "__getitem__") {
+            let pt = self.p.funcs[f].params.first().map(|p| self.p.funcs[f].vars[p.var].ty.clone());
+            let k = self.expr(&s.slice, pt.as_ref())?;
+            return self.call_dunder(base, f, vec![k], line);
+        }
         let bt = self.norm(&base.ty);
         if let AExpr::Slice(sl) = &*s.slice {
             if !matches!(bt, Ty::List(_) | Ty::Str) {
@@ -2659,6 +2930,10 @@ impl Front {
             return Ok((Iter::Over(x), Ty::Str));
         }
         let x = self.expr(e, None)?;
+        if self.norm(&x.ty) == Ty::File {
+            let l = self.mk(line, Ty::list(Ty::Str), ExprKind::Builtin("file.readlines", vec![x]));
+            return Ok((Iter::Over(l), Ty::Str));
+        }
         let t = match self.norm(&x.ty) {
             Ty::List(t) | Ty::Set(t) | Ty::Deque(t) => *t,
             Ty::Dict(k, _, _) => *k,
@@ -2940,7 +3215,10 @@ impl Front {
         match &*c.func {
             AExpr::Name(n) => {
                 let name = n.id.as_str();
-                if self.lookup(name).is_some() {
+                if let Some(v) = self.lookup(name) {
+                    if let Ty::Func(ps, r) = self.norm(&self.var(v).ty) {
+                        return self.call_value(v, &ps, &r, args, line);
+                    }
                     return err(line, format!("`{}` is not callable", name));
                 }
                 if let Some(&fid) = self.funcs.get(name) {
@@ -3089,7 +3367,7 @@ impl Front {
     fn call_args(&mut self, fid: FuncId, args: &ast::Arguments, _method: bool, line: u32) -> Res<Vec<Expr>> {
         let params: Vec<(String, Ty, Option<Expr>)> = {
             let f = &self.p.funcs[fid];
-            f.params
+            f.params[..f.params.len() - f.captures.len()]
                 .iter()
                 .map(|p| (f.vars[p.var].name.clone(), f.vars[p.var].ty.clone(), p.default.clone()))
                 .collect()
@@ -3128,6 +3406,7 @@ impl Front {
                 },
             }
         }
+        out.extend(self.capture_args(fid, line)?);
         Ok(out)
     }
 
@@ -3219,6 +3498,10 @@ impl Front {
             "len" => {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], None)?;
+                let x = match self.unary_dunder(x, "__len__", line)? {
+                    Ok(e) => return Ok(e),
+                    Err(x) => x,
+                };
                 match self.norm(&x.ty) {
                     Ty::List(_) | Ty::Str | Ty::Dict(..) | Ty::Set(_) | Ty::Tuple(_) | Ty::Deque(_) => b(self, "len", Ty::Int, vec![x]),
                     t => err(line, format!("{} has no len()", self.tn(&t))),
@@ -3227,6 +3510,10 @@ impl Front {
             "abs" => {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], want)?;
+                let x = match self.unary_dunder(x, "__abs__", line)? {
+                    Ok(e) => return Ok(e),
+                    Err(x) => x,
+                };
                 self.settle(&x.ty);
                 let t = self.norm(&x.ty);
                 if !t.is_num() {
@@ -3456,8 +3743,9 @@ impl Front {
                 let d = self.class_arg(&args.args[1], line)?;
                 self.isinstance(x, d, None, line)
             }
+            "open" => self.open_call(args, line),
             "type" | "id" | "hash" | "getattr" | "setattr" | "hasattr" | "eval" | "exec"
-            | "globals" | "locals" | "vars" | "open" | "iter" | "next" | "map" | "filter" | "super" => {
+            | "globals" | "locals" | "vars" | "iter" | "next" | "map" | "filter" | "super" => {
                 err(line, format!("{}() is outside the typed subset", name))
             }
             _ if EXCEPTIONS.contains(&name) => err(line, "exceptions can only be raised"),
@@ -3589,6 +3877,9 @@ impl Front {
                 };
                 if m == "__init__" {
                     return err(line, "__init__ cannot be called directly");
+                }
+                if self.p.funcs[fid].property {
+                    return err(line, format!("`{}` is a property: read it without ()", m));
                 }
                 let a = self.call_args(fid, args, true, line)?;
                 let t = self.p.funcs[fid].ret.clone();

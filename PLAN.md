@@ -11,10 +11,27 @@ rejection has a test in `tests/err/`.
 | v0.4 | mutable reference locals, moving out of narrowed values, `from rust import Ref, Mut, Own`, `py2rs explain`, usability batch | done |
 | v0.5 | `from rust.CRATE import X`: Cargo dependencies, rustdoc-JSON stubs, borrow / Result / Option mapping, `inline` | done |
 | v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time | done |
-| v0.7 | `with`, files, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | |
+| v0.7 | `with`, files, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | done |
 | v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | |
 | v0.9 | benchmarks vs CPython, ASCII strings, fewer clones, buffered print, optional bigint / fixed-width ints, CPython set order | |
 | v1.0 | crates.io packages (publish needs the owner's go-ahead), docs in three languages, subset spec, case studies, PyO3 module output | |
+
+## v0.7 result
+
+- operator methods (`front/dunder.rs`): `a + b` → `a.op_add(&b)` (also reflected `__radd__`,
+  `a += b` rebinds), comparisons, `len`, `abs`, `x[i]`, `x[i] = v`, `in`, truth; a class with
+  `__eq__` implements `PartialEq` by it (so `in` / `index` agree), `__lt__` gives `PyOrd`
+  (sorted / min / max / heapq)
+- `@property`, `@classmethod` (`cls` names the class the method is compiled for, so
+  subclasses get their own), constant class attributes (module constants `CLASS_ATTR`)
+- nested functions (`front/nested.rs`) are lifted; their captured variables are extra
+  parameters passed at each call, `nonlocal` ones by `&mut`
+- `Callable[[A], R]` → `&impl Fn(A) -> R` (Copy arguments by value, others by reference);
+  lambdas and functions as arguments (`&square` when the signature already fits)
+- `match` (`front/matching.rs`) is rewritten as Python `if` / `elif` source and lowered like
+  hand-written code
+- `with open(...) as f`, `read` / `readline` / `readlines` / iteration / `write`,
+  `os.path.exists` / `join`, `os.remove`, `OSError` / `FileNotFoundError`
 
 ## v0.6 result
 

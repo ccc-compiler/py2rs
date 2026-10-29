@@ -153,6 +153,11 @@ pub fn analyze(p: &Program) -> Res<Own> {
                 let _ = a.collect();
                 let mut modes = vec![];
                 for (i, q) in f.params.iter().enumerate() {
+                    // a `nonlocal` variable of a nested function is the caller's, by `&mut`
+                    if nonlocal(f, i) {
+                        modes.push((Mode::Mut, false));
+                        continue;
+                    }
                     if o.params[fid][i] == Mode::Copy {
                         modes.push((Mode::Copy, false));
                         continue;
@@ -337,6 +342,11 @@ pub fn immutable_ty(t: &Ty, classes: &[bool]) -> bool {
 
 fn prefix(a: &Path, b: &Path) -> bool {
     a.len() <= b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y)
+}
+
+/// Is parameter i a `nonlocal` variable captured by a nested function?
+pub fn nonlocal(f: &Func, i: usize) -> bool {
+    i >= f.params.len() - f.captures.len() && f.params[i].force == Some(Force::Mut)
 }
 
 /// Methods of builtin types that modify their receiver.

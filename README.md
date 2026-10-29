@@ -117,7 +117,12 @@ with `__init__`, methods, `@staticmethod`, `__str__` / `__repr__`; single inheri
 with overriding, `super()`, `isinstance`; if / while / for (with `else`), comprehensions,
 generator expressions in `sum/min/max/any/all/sorted/list/set/join`, `lambda` as `key=`,
 f-strings with format specs, `try` / `except` / `else` / `finally`, `raise`, exception
-classes, `assert`, `del`, most `str` / `list` / `dict` / `set` methods.
+classes, `assert`, `del`, most `str` / `list` / `dict` / `set` methods; operator methods
+(`__add__` ... `__eq__`, `__lt__`, `__len__`, `__getitem__`, `__setitem__`, `__contains__`,
+`__bool__`, `__neg__`, `__abs__`), `@property`, `@classmethod`, constant class attributes;
+nested functions (also recursive, with `nonlocal`); `Callable[[A], R]` parameters with
+lambdas or functions as arguments; `match` (literal, capture, `|`, guard, sequence with
+`*rest`, class and `None` patterns); `with open(...) as f` and text files.
 
 Standard library (`import M` or `from M import x`):
 
@@ -134,6 +139,7 @@ Standard library (`import M` or `from M import x`):
 | `sys` | `argv`, `exit`, `stdin` (`readline`, `read`, `readlines`, iteration), `stdout.write`, `maxsize`, `setrecursionlimit` (the program runs on a 1 GB stack) |
 | `time` | `time`, `perf_counter`, `monotonic`, `sleep` |
 | `json` | `dumps` |
+| `os` | `path.exists`, `path.join`, `remove` |
 
 How the Python constructs map to Rust:
 
@@ -150,6 +156,10 @@ How the Python constructs map to Rust:
 | a `raise` some `try` up the call chain catches | `Result<T, PyErr>` on that path only, `?` |
 | a `raise` nothing catches | `pyrt::raise(..)`: traceback and exit 1, like CPython |
 | `try:` | `'ok: { let e = 'body: { ...; break 'ok; }; match e { .. } }` |
+| a nested function using `seen` and `nonlocal count` | a module-level `fn dfs(.., seen: &mut HashSet<..>, count: &mut i64)`, the variables passed at each call |
+| `f: Callable[[int], int]`, `apply(square, 3)`, `lambda x: x + k` | `f: &impl Fn(i64) -> i64`, `apply(&square, 3)`, `&(\|x: i64\| x + k)` |
+| `match s:` / `case Circle(r=r) if r > 0:` | `if let` chains from `isinstance` and comparisons |
+| `def __add__(self, o)`, `a + b` | `fn op_add(&self, o: &V) -> V`, `a.op_add(&b)`; `__eq__` / `__lt__` give `PartialEq` / `PyOrd` |
 
 Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
 `eval` / `exec` / `getattr` / `globals`, `global` / `nonlocal`, mutable defaults,
@@ -157,7 +167,9 @@ Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
 iterating over it, `x or default` on non-bools, `is` other than with None, overrides that
 change a method's types, multiple inheritance. Not yet supported: return / break inside
 `try ... finally`, exceptions from comprehensions inside a `try`, exception classes with
-fields, `with`, `match`, generators (`yield`), async, files, other modules. In `re`:
+fields, generators (`yield`), async, `with` other than `open`, mutable class attributes,
+property setters, Callables stored in containers or fields, nested functions with captured
+variables used as values, mapping patterns, other modules. In `re`:
 lookaround and backreferences (the regex crate has neither), `$` without `re.M`
 (Python's `$` also matches before a final newline; use `\Z` or `fullmatch`), function
 replacements; `Match.group(n)` of a group that did not take part raises (Python gives

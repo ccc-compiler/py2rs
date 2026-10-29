@@ -47,7 +47,7 @@ pub fn mutating(n: &str) -> bool {
             | "bisect.insort_left" | "bisect.insort_right" | "random.shuffle" | "deque.append"
             | "deque.appendleft" | "deque.pop" | "deque.popleft" | "deque.extend" | "deque.clear"
             | "counter.update"
-    )
+    ) || n.starts_with("file.")
 }
 
 /// `@functools.cache`: the function is renamed `NAME_uncached` and a wrapper
@@ -124,6 +124,10 @@ impl FGen<'_> {
 
     pub(super) fn std_builtin(&mut self, name: &str, a: &[Expr], e: &Expr) -> Res<R> {
         let v = |c: String| r(c, Kind::Val, ATOM);
+        if name == "open" {
+            let p = self.borrow_str(&a[0])?;
+            return Ok(v(format!("pyrt::files::open({}, {:?})", p, lit(&a[1]))));
+        }
         let (module, f) = name.split_once('.').unwrap();
         Ok(match (module, f) {
             ("collections", "defaultdict") => {
@@ -240,6 +244,24 @@ impl FGen<'_> {
                 v(format!("pyrt::stdlib::sample({}, {})", xs, self.val(&a[1])?.code))
             }
             ("re", _) => self.re_builtin(f, a, e)?,
+            ("file", _) => {
+                let fv = self.ex_mut(&a[0])?;
+                let fc = par(&fv, ATOM);
+                match f {
+                    "write" => v(format!("{}.write({})", fc, self.borrow_str(&a[1])?)),
+                    "writelines" => v(format!("{}.writelines({})", fc, self.borrow(&a[1])?)),
+                    _ => v(format!("{}.{}()", fc, f)),
+                }
+            }
+            ("os", "path.exists") => v(format!("pyrt::files::exists({})", self.borrow_str(&a[0])?)),
+            ("os", "remove") => v(format!("pyrt::files::remove({})", self.borrow_str(&a[0])?)),
+            ("os", "path.join") => {
+                let mut xs = vec![];
+                for x in a {
+                    xs.push(self.borrow_str(x)?);
+                }
+                v(format!("pyrt::files::join(&[{}])", xs.join(", ")))
+            }
             ("sys", "argv") => v("pyrt::stdlib::argv()".into()),
             ("sys", "exit") => v(format!("pyrt::stdlib::exit({})", self.val(&a[0])?.code)),
             ("sys", "stdin.readline") => v("pyrt::stdlib::readline()".into()),

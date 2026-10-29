@@ -28,6 +28,10 @@ pub const ASSERTION_ERROR: &[&str] = &["AssertionError", "Exception", "BaseExcep
 pub const ATTRIBUTE_ERROR: &[&str] = &["AttributeError", "Exception", "BaseException"];
 pub const EOF_ERROR: &[&str] = &["EOFError", "Exception", "BaseException"];
 pub const NAME_ERROR: &[&str] = &["NameError", "Exception", "BaseException"];
+pub const OS_ERROR: &[&str] = &["OSError", "Exception", "BaseException"];
+pub const FILE_NOT_FOUND_ERROR: &[&str] = &["FileNotFoundError", "OSError", "Exception", "BaseException"];
+pub const PERMISSION_ERROR: &[&str] = &["PermissionError", "OSError", "Exception", "BaseException"];
+pub const IS_A_DIRECTORY_ERROR: &[&str] = &["IsADirectoryError", "OSError", "Exception", "BaseException"];
 pub const STOP_ITERATION: &[&str] = &["StopIteration", "Exception", "BaseException"];
 
 impl PyErr {
@@ -122,6 +126,10 @@ pub fn builtin_chain(name: &str) -> &'static [&'static str] {
         "StopIteration" => STOP_ITERATION,
         "NameError" => NAME_ERROR,
         "RuntimeError" => RUNTIME_ERROR,
+        "OSError" => OS_ERROR,
+        "FileNotFoundError" => FILE_NOT_FOUND_ERROR,
+        "PermissionError" => PERMISSION_ERROR,
+        "IsADirectoryError" => IS_A_DIRECTORY_ERROR,
         _ => EXCEPTION,
     }
 }
