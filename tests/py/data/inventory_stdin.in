@@ -1,0 +1,14 @@
+5
+A100 | hex bolt     | 500 | 0.12 | 100
+A200 | wing nut     | 80  | 0.25 | 100
+B310 | hinge        | 40  | 3.40 | 10
+C001 | drawer slide | 12  | 9.99 | 5
+C777 | knob, brass  | 60  | 1.75 | 20
+7
+out A100 450
+in A200 50
+out B310 35
+out C001 20
+in Z999 3
+out C777 10
+in A100 25

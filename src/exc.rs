@@ -82,7 +82,10 @@ pub fn op_kinds(e: &Expr) -> (Vec<&'static str>, Vec<&'static str>) {
             "math.sqrt" | "math.log" => (vec!["ValueError"], vec![]),
             "math.log2" | "math.log10" | "math.asin" | "math.acos" | "math.log2args" | "math.pow" | "math.fmod"
             | "math.isqrt" | "math.factorial" | "math.comb" | "math.perm" | "chr" | "min_iter" | "max_iter"
-            | "str.rindex" | "str.split" | "powmod" => (vec![], vec!["ValueError"]),
+            | "str.rindex" | "powmod" => (vec![], vec!["ValueError"]),
+            // only an empty separator raises
+            "str.split" if matches!(&a[1].kind, K::Str(sep) if !sep.is_empty()) => (vec![], vec![]),
+            "str.split" => (vec![], vec!["ValueError"]),
             "math.exp" | "math.floor" | "math.ceil" | "math.trunc" | "round" | "math.sinh" | "math.cosh" => {
                 (vec![], vec!["ValueError", "OverflowError"])
             }
@@ -368,13 +371,9 @@ fn reraises_any(hs: &[Handler]) -> bool {
 }
 
 fn check_expr(p: &Program, x: &Exc, e: &Expr, ctx: &HashSet<String>, closure: bool) -> Res<()> {
+    // the second list goes through pyrt::catching
     let (ok, bad) = op_kinds(e);
-    for k in bad {
-        if caught(p, k, ctx) {
-            return Err(Error::new(e.line, format!("catching the {} this operation may raise is not supported yet", k)));
-        }
-    }
-    let mut fails = ok.iter().any(|k| caught(p, k, ctx));
+    let mut fails = ok.iter().chain(bad.iter()).any(|k| caught(p, k, ctx));
     if let ExprKind::Call(f, _) | ExprKind::Method(_, f, _) = &e.kind {
         fails |= x.fallible[*f];
     }

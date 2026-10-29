@@ -9,6 +9,7 @@ crate (translator + CLI) and `pyrt/` (runtime used by generated code).
 cargo build --release
 ./target/release/py2rs test          # all of tests/: diff vs CPython + expected rejections
 ./target/release/py2rs emit F.py     # inspect generated Rust
+./target/release/py2rs fuzz 300 SEED # random programs vs CPython (failures in target/py2rs-cache/fuzz-fail/)
 ```
 
 `py2rs test` builds every generated program as a bin of one package under
@@ -64,4 +65,11 @@ Generated projects use edition 2024 (let chains).
   `try` → `'ok: { let e = 'body: { ...; break 'ok; }; match e {..} }` so rustc's
   definite-assignment sees the success path; loops crossed by break / continue get labels
   (`loop_label`). Exception classes are `pyrt::*` / generated `const X: &[&str]` chains.
+- v0.3: `own::definite` (definite assignment, our error instead of rustc E0381); `fuzz.rs`
+  (random programs); `PY2RS_TEST_DIR` for parallel test runs; dead stores are dropped and
+  never-read names get `_` (generated code stays warning-free); `count3` counts assignments
+  per path (incl. exception paths) for `mut`; writes with a computed list index hoist the
+  index (`index_mut_code`, `FGen.pre` lines are flushed before each statement);
+  `pyrt::catching(|| op)` turns `raise` / panics into `Err` for failing builtins without a
+  `try_` variant (`exc::op_kinds` second list; `FGen.in_catching`).
 

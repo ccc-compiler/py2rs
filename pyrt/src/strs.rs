@@ -147,8 +147,34 @@ fn all_nonempty(s: &str, f: impl Fn(char) -> bool) -> bool {
     !s.is_empty() && s.chars().all(f)
 }
 
+/// Digits that are not decimal: superscripts, subscripts, circled (Numeric_Type=Digit).
+fn digit_only(c: char) -> bool {
+    matches!(c as u32, 0xB2 | 0xB3 | 0xB9 | 0x2070 | 0x2074..=0x2079 | 0x2080..=0x2089 | 0x2460..=0x2468
+        | 0x2474..=0x247C | 0x2488..=0x2490 | 0x24EA | 0x24F5..=0x24FD | 0x24FF | 0x2776..=0x277E
+        | 0x2780..=0x2788 | 0x278A..=0x2792 | 0x1369..=0x1371 | 0x19DA)
+}
+
+/// Numeric characters that are not digits: fractions, roman numerals, larger numbers.
+fn numeric_only(c: char) -> bool {
+    matches!(c as u32, 0xBC..=0xBE | 0x2150..=0x218B | 0x2469..=0x2473 | 0x247D..=0x2487 | 0x2491..=0x249B
+        | 0x24EB..=0x24F4 | 0x24FE | 0x277F | 0x2789 | 0x2793 | 0x2CFD | 0x3007 | 0x3021..=0x3029 | 0x3038..=0x303A
+        | 0x3192..=0x3195 | 0x3220..=0x3229 | 0x3248..=0x324F | 0x3251..=0x325F | 0x3280..=0x3289 | 0x32B1..=0x32BF
+        | 0x16EE..=0x16F0 | 0x1372..=0x137C | 0x0BF0..=0x0BF2 | 0x09F4..=0x09F9)
+}
+
+/// `str.isdecimal()` (Unicode Nd)
+pub fn isdecimal(s: &str) -> bool {
+    all_nonempty(s, |c| c.is_ascii_digit() || (!c.is_ascii() && c.is_numeric() && !digit_only(c) && !numeric_only(c)))
+}
+
+/// `str.isdigit()` (decimal digits and superscripts and the like)
 pub fn isdigit(s: &str) -> bool {
-    all_nonempty(s, |c| c.is_ascii_digit() || (!c.is_ascii() && c.is_numeric()))
+    all_nonempty(s, |c| c.is_ascii_digit() || (!c.is_ascii() && c.is_numeric() && !numeric_only(c)))
+}
+
+/// `str.isnumeric()`
+pub fn isnumeric(s: &str) -> bool {
+    all_nonempty(s, |c| c.is_numeric())
 }
 
 pub fn isalpha(s: &str) -> bool {

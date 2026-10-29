@@ -7,6 +7,7 @@
 pub mod diag;
 pub mod exc;
 pub mod front;
+pub mod fuzz;
 pub mod gen;
 pub mod ir;
 pub mod own;

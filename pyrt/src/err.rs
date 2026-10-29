@@ -95,6 +95,59 @@ macro_rules! check {
 
 pub type PyResult<T> = Result<T, PyErr>;
 
+thread_local! {
+    static CATCHING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn catching_now() -> bool {
+    CATCHING.with(|c| c.get() > 0)
+}
+
+/// The class chain of a builtin exception name.
+pub fn builtin_chain(name: &str) -> &'static [&'static str] {
+    match name {
+        "ValueError" => VALUE_ERROR,
+        "TypeError" => TYPE_ERROR,
+        "IndexError" => INDEX_ERROR,
+        "KeyError" => KEY_ERROR,
+        "LookupError" => LOOKUP_ERROR,
+        "ZeroDivisionError" => ZERO_DIVISION_ERROR,
+        "ArithmeticError" => ARITHMETIC_ERROR,
+        "OverflowError" => OVERFLOW_ERROR,
+        "NotImplementedError" => NOT_IMPLEMENTED_ERROR,
+        "AssertionError" => ASSERTION_ERROR,
+        "AttributeError" => ATTRIBUTE_ERROR,
+        "EOFError" => EOF_ERROR,
+        "StopIteration" => STOP_ITERATION,
+        "RuntimeError" => RUNTIME_ERROR,
+        _ => EXCEPTION,
+    }
+}
+
+/// Run an operation whose exception a `try` catches: what it raises (or a
+/// Rust panic such as an index out of range) becomes the `Err`.
+pub fn catching<T>(f: impl FnOnce() -> T) -> PyResult<T> {
+    CATCHING.with(|c| c.set(c.get() + 1));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CATCHING.with(|c| c.set(c.get() - 1));
+    match r {
+        Ok(v) => Ok(v),
+        Err(p) => match p.downcast::<PyErr>() {
+            Ok(e) => Err(*e),
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                let text = crate::exception_of(&msg);
+                let (k, m) = text.split_once(": ").unwrap_or((&text, ""));
+                Err(PyErr::new(builtin_chain(k), m))
+            }
+        },
+    }
+}
+
 // ---------------------------------------------------------------- fallible ops
 
 /// A list index, IndexError when out of range.
@@ -128,14 +181,14 @@ where
 
 pub fn try_floordiv(a: i64, b: i64) -> PyResult<i64> {
     if b == 0 {
-        return Err(PyErr::new(ZERO_DIVISION_ERROR, "integer division or modulo by zero"));
+        return Err(PyErr::new(ZERO_DIVISION_ERROR, "division by zero"));
     }
     Ok(crate::floordiv(a, b))
 }
 
 pub fn try_modulo(a: i64, b: i64) -> PyResult<i64> {
     if b == 0 {
-        return Err(PyErr::new(ZERO_DIVISION_ERROR, "integer modulo by zero"));
+        return Err(PyErr::new(ZERO_DIVISION_ERROR, "division by zero"));
     }
     Ok(crate::modulo(a, b))
 }
@@ -149,14 +202,14 @@ pub fn try_div(a: f64, b: f64) -> PyResult<f64> {
 
 pub fn try_ffloordiv(a: f64, b: f64) -> PyResult<f64> {
     if b == 0.0 {
-        return Err(PyErr::new(ZERO_DIVISION_ERROR, "float floor division by zero"));
+        return Err(PyErr::new(ZERO_DIVISION_ERROR, "division by zero"));
     }
     Ok(crate::ffloordiv(a, b))
 }
 
 pub fn try_fmod(a: f64, b: f64) -> PyResult<f64> {
     if b == 0.0 {
-        return Err(PyErr::new(ZERO_DIVISION_ERROR, "float modulo by zero"));
+        return Err(PyErr::new(ZERO_DIVISION_ERROR, "division by zero"));
     }
     Ok(crate::fmod(a, b))
 }

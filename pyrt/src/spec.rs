@@ -139,14 +139,17 @@ pub fn format_int(x: i64, sp: &Spec) -> String {
         Some('o') => (format!("{:o}", mag), "0o", 4),
         _ => (mag.to_string(), "", 3),
     };
-    let mut body = match sp.grouping {
+    let body = match sp.grouping {
         Some(g) => group(&digits, g, every),
         None => digits,
     };
-    if sp.alt && !prefix.is_empty() {
-        body = format!("{}{}", prefix, body);
-    }
-    pad(sign_str(neg, sp), &body, sp, true)
+    // `#06x`: zero padding goes between `0x` and the digits
+    let sign = if sp.alt && !prefix.is_empty() {
+        format!("{}{}", sign_str(neg, sp), prefix)
+    } else {
+        sign_str(neg, sp).to_string()
+    };
+    pad(&sign, &body, sp, true)
 }
 
 /// Digits and exponent of `x` rounded to `prec` significant digits.

@@ -1,0 +1,15 @@
+4
+111/The Pragmatic Programmer/Hunt/2
+222/Structure and Interpretation of Computer Programs/Abelson/1
+333/Dune/Herbert/3
+444/Rust in Action/McNamara/1
+9
+111 kim 1 10
+222 lee 2 30
+333 kim 3 40
+111 park 5
+222 kim 31
+444 lee 7 21
+333 lee 8 60
+333 choi 9
+444 park 22

@@ -18,7 +18,11 @@ pub use strs::*;
 // ------------------------------------------------------------------ errors
 
 /// Raise an uncaught Python exception: print it like CPython and exit with 1.
+/// Inside `catching`, it becomes the `PyErr` of that call instead.
 pub fn raise(exc: &str, msg: &str) -> ! {
+    if err::catching_now() {
+        std::panic::panic_any(PyErr::new(err::builtin_chain(exc), msg));
+    }
     let _ = std::io::stdout().flush();
     eprintln!("Traceback (most recent call last):");
     if msg.is_empty() {
@@ -29,7 +33,7 @@ pub fn raise(exc: &str, msg: &str) -> ! {
     std::process::exit(1)
 }
 
-fn exception_of(msg: &str) -> String {
+pub(crate) fn exception_of(msg: &str) -> String {
     let first = msg.split(':').next().unwrap_or("");
     if !first.is_empty()
         && first.chars().all(|c| c.is_ascii_alphanumeric())
@@ -44,7 +48,7 @@ fn exception_of(msg: &str) -> String {
         return "IndexError: list index out of range".into();
     }
     if msg.contains("divide by zero") || msg.contains("divisor of zero") {
-        return "ZeroDivisionError: integer division or modulo by zero".into();
+        return "ZeroDivisionError: division by zero".into();
     }
     if msg.starts_with("assertion failed") {
         return "AssertionError".into();
@@ -58,6 +62,9 @@ fn exception_of(msg: &str) -> String {
 /// Call first in `main`: Rust panics are reported as Python exceptions.
 pub fn init() {
     std::panic::set_hook(Box::new(|info| {
+        if err::catching_now() {
+            return;
+        }
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -398,7 +405,7 @@ impl<T: Fmt + ?Sized> Fmt for &T {
 /// `a // b` on ints
 pub fn floordiv(a: i64, b: i64) -> i64 {
     if b == 0 {
-        raise("ZeroDivisionError", "integer division or modulo by zero");
+        raise("ZeroDivisionError", "division by zero");
     }
     let q = a.checked_div(b).unwrap_or_else(|| panic!("attempt to divide with overflow"));
     if (a % b != 0) && ((a < 0) != (b < 0)) {
@@ -411,7 +418,7 @@ pub fn floordiv(a: i64, b: i64) -> i64 {
 /// `a % b` on ints (the result has the sign of `b`)
 pub fn modulo(a: i64, b: i64) -> i64 {
     if b == 0 {
-        raise("ZeroDivisionError", "integer modulo by zero");
+        raise("ZeroDivisionError", "division by zero");
     }
     let r = a.wrapping_rem(b);
     if r != 0 && ((r < 0) != (b < 0)) {
@@ -432,7 +439,7 @@ pub fn div(a: f64, b: f64) -> f64 {
 /// `a // b` on floats
 pub fn ffloordiv(a: f64, b: f64) -> f64 {
     if b == 0.0 {
-        raise("ZeroDivisionError", "float floor division by zero");
+        raise("ZeroDivisionError", "division by zero");
     }
     let m = a % b;
     let mut d = (a - m) / b;
@@ -454,7 +461,7 @@ pub fn ffloordiv(a: f64, b: f64) -> f64 {
 /// `a % b` on floats
 pub fn fmod(a: f64, b: f64) -> f64 {
     if b == 0.0 {
-        raise("ZeroDivisionError", "float modulo by zero");
+        raise("ZeroDivisionError", "division by zero");
     }
     let mut m = a % b;
     if m != 0.0 {
@@ -570,6 +577,22 @@ pub fn round2(x: f64, n: i64) -> f64 {
         let m = 10f64.powi((-n).min(308) as i32);
         (x / m).round_ties_even() * m
     }
+}
+
+/// `round(n, k)` of an int (k < 0 rounds to tens, hundreds, ... half to even)
+pub fn round_int(n: i64, k: i64) -> i64 {
+    if k >= 0 {
+        return n;
+    }
+    if k < -18 {
+        return 0;
+    }
+    let m = 10i128.pow((-k) as u32);
+    let v = n as i128;
+    let q = v.div_euclid(m);
+    let r = v.rem_euclid(m);
+    let q = if 2 * r > m || (2 * r == m && q % 2 != 0) { q + 1 } else { q };
+    i64::try_from(q * m).unwrap_or_else(|_| panic!("attempt to multiply with overflow"))
 }
 
 /// Python's `sum()` of floats (Neumaier compensated, CPython ≥ 3.12)

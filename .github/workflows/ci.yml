@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: build
+        run: cargo build --release
+      - name: differential test against CPython
+        run: PY2RS_PYTHON=python ./target/release/py2rs test
+      - name: random programs
+        run: PY2RS_PYTHON=python ./target/release/py2rs fuzz 200 1

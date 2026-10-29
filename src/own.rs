@@ -49,6 +49,8 @@ pub struct Own {
     pub via: Vec<HashSet<VarId>>,
     /// locals that only ever refer to existing values: `&T` instead of a copy
     pub views: Vec<HashSet<VarId>>,
+    /// variables live after each statement (stmt id)
+    pub live_out: HashMap<u32, HashSet<VarId>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +106,9 @@ pub fn analyze(p: &Program) -> Res<Own> {
         ..Default::default()
     };
     class_immutability(p, &mut o);
+    for f in &p.funcs {
+        definite(f)?;
+    }
     // parameter modes: iterate to a fixpoint (calls propagate &mut)
     loop {
         let mut changed = false;
@@ -138,7 +143,8 @@ pub fn analyze(p: &Program) -> Res<Own> {
             }
             let (modes, self_m, ret_alias, self_escapes) = {
                 let mut a = Fn::new(p, &o, fid);
-                a.collect()?;
+                // modes are not final yet: errors are reported by the last pass
+                let _ = a.collect();
                 let mut modes = vec![];
                 for (i, q) in f.params.iter().enumerate() {
                     if o.params[fid][i] == Mode::Copy {
@@ -193,10 +199,12 @@ pub fn analyze(p: &Program) -> Res<Own> {
             let via: HashSet<VarId> = a.muts.iter().map(|m| m.via).collect();
             let takes = std::mem::take(&mut a.takes);
             let views = a.views();
+            let lo = std::mem::take(&mut a.live_out);
             let (m, mu, r, i, l) = a.results();
-            (m, mu, r, i, l, via, (takes, views))
+            (m, mu, r, i, l, via, (takes, views, lo))
         };
-        let (takes, views) = takes;
+        let (takes, views, lo) = takes;
+        o.live_out.extend(lo);
         o.views[fid] = views;
         o.takes.extend(takes);
         o.via[fid] = via;
@@ -255,11 +263,12 @@ fn class_immutability(p: &Program, o: &mut Own) {
     for (i, c) in p.classes.iter().enumerate() {
         o.immutable[i] = c.frozen || !assigned.contains(&i);
     }
-    // field types
+    // field types; a value of a class may be any of its subclasses
     loop {
         let mut changed = false;
         for (i, c) in p.classes.iter().enumerate() {
-            if o.immutable[i] && !c.fields.iter().all(|f| immutable_ty(&f.ty, &o.immutable)) {
+            let subs_mut = p.subtree(i).iter().any(|x| !o.immutable[*x]);
+            if o.immutable[i] && (subs_mut || !c.fields.iter().all(|f| immutable_ty(&f.ty, &o.immutable))) {
                 o.immutable[i] = false;
                 changed = true;
             }
@@ -482,7 +491,7 @@ impl<'a> Fn<'a> {
                 let direct: Vec<VarId> = vars
                     .iter()
                     .copied()
-                    .filter(|v| !self.f.vars[*v].ty.is_copy() && self.muts[before..].iter().any(|m| m.via == *v))
+                    .filter(|v| !self.f.vars[*v].ty.is_copy() && self.muts[before..].iter().any(|m| self.via_reaches(m.via, *v)))
                     .collect();
                 if !direct.is_empty() {
                     self.iter_mut.insert(s.id);
@@ -584,6 +593,20 @@ impl<'a> Fn<'a> {
         let pos = self.cur_pos;
         let sid = self.cur_stmt;
         self.muts.push(Mutation { via, root, path, deep, pos, line, sid });
+    }
+
+    /// Is `via` the variable `v` or a narrowed value borrowed from it?
+    fn via_reaches(&self, via: VarId, v: VarId) -> bool {
+        let mut x = via;
+        loop {
+            if x == v {
+                return true;
+            }
+            match self.origin.get(&x) {
+                Some((r, _)) if self.f.vars[x].kind == VarKind::Narrow => x = *r,
+                _ => return false,
+            }
+        }
     }
 
     fn resolve(&self, root: VarId, path: Path) -> (VarId, Path) {
@@ -805,6 +828,26 @@ impl<'a> Fn<'a> {
                 }
             }
         }
+        // `self.state.insert(self)`: an argument modified (or a receiver modified)
+        // while the other one borrows the same object
+        if let Some(r) = recv {
+            if let Some((root, rp)) = self.place(r) {
+                let (rr, _) = self.resolve(root, rp.clone());
+                for (i, a) in args.iter().enumerate() {
+                    if self.o.params[fid][i] != Mode::Mut || rp.is_empty() {
+                        continue;
+                    }
+                    let mut vs = vec![];
+                    uses(a, &mut vs);
+                    if vs.iter().any(|v| self.resolve(*v, vec![]).0 == rr) {
+                        self.errors.push(Error::new(e.line, format!(
+                            "{}() would modify `{}` while one of its parts is in use as the receiver",
+                            callee.name, self.f.vars[root].name))
+                            .hint("let the method return what should change, and apply it afterwards"));
+                    }
+                }
+            }
+        }
         if let Some(r) = recv {
             if self.o.self_mut[fid] {
                 for a in args {
@@ -926,6 +969,16 @@ impl<'a> Fn<'a> {
             return false;
         }
         let Some(cur) = self.find_stmt(self.cur_stmt) else { return false };
+        // `self.head = self.head.next`: the target's old value is dropped here
+        if let StmtKind::Assign(Target::Place(t), v) = &cur.kind {
+            if let Some((tr, tp)) = self.place(t) {
+                let (tr, tp) = self.resolve(tr, tp);
+                let (er, ep) = self.resolve(root, path.clone());
+                if tr == er && ep.len() > tp.len() && prefix(&tp, &ep) && std::ptr::eq(v, e) {
+                    return true;
+                }
+            }
+        }
         // the place occurs once in this statement
         let mut n = 0;
         let count = |x: &Expr, n: &mut i32| {
@@ -1009,6 +1062,22 @@ impl<'a> Fn<'a> {
                 if let VarKind::Param = self.f.vars[r].kind {
                     let i = self.f.params.iter().position(|q| q.var == r).unwrap();
                     if self.o.params[self.fid][i] == Mode::Owned {
+                        continue 'var;
+                    }
+                }
+                // a write to what it borrows while it is still needed
+                let (r2, p2) = self.resolve(r, self.place(v).map(|x| x.1).unwrap_or_default());
+                for m in &self.muts {
+                    if m.root != r2 || !(prefix(&m.path, &p2) || prefix(&p2, &m.path)) {
+                        continue;
+                    }
+                    let live = self.live_out.get(&m.sid).map(|l| l.contains(&w)).unwrap_or(true);
+                    let used_there = self.find_stmt(m.sid).map(|st| {
+                        let mut u = vec![];
+                        stmt_uses_shallow(st, &mut u);
+                        u.contains(&w)
+                    }).unwrap_or(true);
+                    if live || used_there {
                         continue 'var;
                     }
                 }
@@ -1284,9 +1353,11 @@ impl<'a> Fn<'a> {
             StmtKind::Try(b, hs, e, f) => {
                 // any statement of the body may jump to a handler: what the
                 // handlers and `finally` need stays alive through the body
+                // an exception no handler takes runs finally and leaves: nothing after is read
+                let lf_exc = self.live_block(f, HashSet::new(), ctx);
                 let lf = self.live_block(f, out, ctx);
                 let le = self.live_block(e, lf.clone(), ctx);
-                let mut lh: HashSet<VarId> = lf.clone();
+                let mut lh: HashSet<VarId> = lf_exc;
                 for h in hs {
                     lh.extend(self.live_block(&h.body, lf.clone(), ctx));
                 }
@@ -1329,6 +1400,15 @@ impl<'a> Fn<'a> {
         };
         match &s.kind {
             StmtKind::Expr(x) | StmtKind::Return(Some(x)) => count(x),
+            // `d[key] = v`: the key (a copy) is evaluated before v moves into insert()
+            StmtKind::Assign(Target::Place(Expr { kind: ExprKind::Index(b, _), .. }), x)
+                if matches!(b.ty, Ty::Dict(..)) && matches!(x.kind, ExprKind::Var(w) if w == v) =>
+            {
+                count(x);
+                let mut u = vec![];
+                uses(b, &mut u);
+                n += u.iter().filter(|w| **w == v).count();
+            }
             StmtKind::Assign(t, x) => {
                 count(x);
                 let mut u = vec![];
@@ -1458,7 +1538,7 @@ impl<'a> Fn<'a> {
             let mut u = vec![];
             stmt_uses_shallow(s, &mut u);
             for v in u {
-                if vars.contains(&v) {
+                if vars.contains(&v) || vars.iter().any(|lv| f.via_reaches(v, *lv)) {
                     continue;
                 }
                 if f.resolve(v, vec![]).0 == root {
@@ -1563,4 +1643,169 @@ fn stmt_exprs_all(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
         }
         _ => {}
     }
+}
+
+// ------------------------------------------------------- definite assignment
+
+/// Every read of a local must follow an assignment on every path (rustc
+/// requires it; Python would raise UnboundLocalError on the other paths).
+pub fn definite(f: &Func) -> Res<()> {
+    // None: this point is not reachable
+    type St = Option<HashSet<VarId>>;
+    fn meet(a: St, b: St) -> St {
+        match (a, b) {
+            (None, x) | (x, None) => x,
+            (Some(a), Some(b)) => Some(a.intersection(&b).copied().collect()),
+        }
+    }
+    struct D<'a> {
+        f: &'a Func,
+        /// states at the breaks of each enclosing loop
+        breaks: Vec<St>,
+    }
+    impl D<'_> {
+        fn read(&self, e: &Expr, s: &HashSet<VarId>) -> Res<()> {
+            let mut u = vec![];
+            uses(e, &mut u);
+            for v in u {
+                if self.f.vars[v].kind == VarKind::Local && !s.contains(&v) {
+                    return Err(Error::new(e.line, format!("`{}` might be used before it is assigned", self.f.vars[v].name))
+                        .hint("assign it on every path before this point (Python would raise UnboundLocalError)"));
+                }
+            }
+            Ok(())
+        }
+        fn block(&mut self, b: &[Stmt], s: St) -> Res<St> {
+            let mut s = s;
+            for st in b {
+                s = self.stmt(st, s)?;
+            }
+            Ok(s)
+        }
+        fn stmt(&mut self, st: &Stmt, s: St) -> Res<St> {
+            let Some(mut cur) = s else { return Ok(None) };
+            match &st.kind {
+                StmtKind::Assign(t, e) => {
+                    self.read(e, &cur)?;
+                    let mut r = Ok(());
+                    t.exprs(&mut |x| {
+                        if r.is_ok() {
+                            r = self.read(x, &cur);
+                        }
+                    });
+                    if let Target::Place(p) = t {
+                        r = r.and_then(|_| self.read(p, &cur));
+                    }
+                    r?;
+                    let mut d = vec![];
+                    t.vars(&mut d);
+                    cur.extend(d);
+                    Ok(Some(cur))
+                }
+                StmtKind::AugVar(v, _, e) => {
+                    self.read(e, &cur)?;
+                    let line = st.line;
+                    if self.f.vars[*v].kind == VarKind::Local && !cur.contains(v) {
+                        return Err(Error::new(line, format!("`{}` might be used before it is assigned", self.f.vars[*v].name)));
+                    }
+                    Ok(Some(cur))
+                }
+                StmtKind::Expr(e) | StmtKind::Del(e) => {
+                    self.read(e, &cur)?;
+                    Ok(Some(cur))
+                }
+                StmtKind::AugAssign(t, _, e) => {
+                    self.read(t, &cur)?;
+                    self.read(e, &cur)?;
+                    Ok(Some(cur))
+                }
+                StmtKind::Assert(c, m) => {
+                    self.read(c, &cur)?;
+                    if let Some(m) = m {
+                        self.read(m, &cur)?;
+                    }
+                    Ok(Some(cur))
+                }
+                StmtKind::Return(e) | StmtKind::Raise(_, e) => {
+                    if let Some(e) = e {
+                        self.read(e, &cur)?;
+                    }
+                    Ok(None)
+                }
+                StmtKind::Reraise(_) | StmtKind::Continue => Ok(None),
+                StmtKind::Break => {
+                    if let Some(b) = self.breaks.last_mut() {
+                        *b = meet(b.take(), Some(cur));
+                    }
+                    Ok(None)
+                }
+                StmtKind::Pass => Ok(Some(cur)),
+                StmtKind::If(c, a, b) => {
+                    self.read(c, &cur)?;
+                    let x = self.block(a, Some(cur.clone()))?;
+                    let y = self.block(b, Some(cur))?;
+                    Ok(meet(x, y))
+                }
+                StmtKind::LetSome(_, e, b) => {
+                    self.read(e, &cur)?;
+                    self.block(b, Some(cur.clone()))?;
+                    Ok(Some(cur))
+                }
+                StmtKind::While(c, body, orelse) => {
+                    self.read(c, &cur)?;
+                    self.breaks.push(None);
+                    self.block(body, Some(cur.clone()))?;
+                    let br = self.breaks.pop().unwrap();
+                    let forever = matches!(c.kind, ExprKind::Bool(true));
+                    let normal = if forever { None } else { self.block(orelse, Some(cur))? };
+                    Ok(meet(normal, br))
+                }
+                StmtKind::For(_, it, body, orelse) => {
+                    let mut r = Ok(());
+                    it.exprs(&mut |x| {
+                        if r.is_ok() {
+                            r = self.read(x, &cur);
+                        }
+                    });
+                    r?;
+                    self.breaks.push(None);
+                    self.block(body, Some(cur.clone()))?;
+                    let br = self.breaks.pop().unwrap();
+                    let normal = self.block(orelse, Some(cur))?;
+                    Ok(meet(normal, br))
+                }
+                StmtKind::Try(b, hs, e, fin) => {
+                    let ok = self.block(b, Some(cur.clone()))?;
+                    let ok = self.block(e, ok)?;
+                    let mut out = ok;
+                    for h in hs {
+                        // an exception can come before any assignment of the body
+                        let x = self.block(&h.body, Some(cur.clone()))?;
+                        out = meet(out, x);
+                    }
+                    if fin.is_empty() {
+                        return Ok(out);
+                    }
+                    // finally runs on every path; it may only rely on what was assigned before the try
+                    self.block(fin, Some(cur))?;
+                    match out {
+                        None => Ok(None),
+                        Some(o) => {
+                            let after = self.block(fin, Some(o))?;
+                            Ok(after)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut start = HashSet::new();
+    for (i, v) in f.vars.iter().enumerate() {
+        if v.kind != VarKind::Local {
+            start.insert(i);
+        }
+    }
+    let mut d = D { f, breaks: vec![] };
+    d.block(&f.body, Some(start))?;
+    Ok(())
 }

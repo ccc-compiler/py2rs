@@ -325,6 +325,8 @@ pub struct Func {
     pub shadows: Vec<(VarId, VarId)>,
     /// a method of a class with subclasses: the implementation of each class
     pub dispatch: Vec<(ClassId, FuncId)>,
+    /// the class whose body contains the method's source (`super()` is relative to it)
+    pub def_class: Option<ClassId>,
 }
 
 #[derive(Clone, Debug)]

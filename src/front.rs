@@ -106,6 +106,21 @@ pub const EXCEPTIONS: &[&str] = &[
     "OverflowError", "LookupError", "StopIteration", "AttributeError", "EOFError", "BaseException",
 ];
 
+fn snake_name(n: &str) -> String {
+    let mut o = String::new();
+    for (i, c) in n.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                o.push('_');
+            }
+            o.extend(c.to_lowercase());
+        } else {
+            o.push(c);
+        }
+    }
+    o
+}
+
 /// Names `m` of `super().m(...)` calls.
 fn super_calls(body: &[AStmt], out: &mut Vec<String>) {
     use ruff_python_ast::visitor::{self, Visitor};
@@ -420,7 +435,7 @@ impl Front {
             self.funcs.insert(d.name.id.to_string(), id);
         }
         let mut bodies: Vec<(FuncId, &ast::StmtFunctionDef)> = Vec::new();
-        let mut asts: HashMap<ClassId, Vec<(String, &ast::StmtFunctionDef)>> = HashMap::new();
+        let mut asts: HashMap<ClassId, Vec<(String, &ast::StmtFunctionDef, ClassId)>> = HashMap::new();
         for d in &cdefs {
             self.class_sig(d, &mut bodies, &mut asts)?;
         }
@@ -476,6 +491,7 @@ impl Front {
             is_static: false,
             shadows: vec![],
             dispatch: vec![],
+            def_class: None,
         });
         self.p.funcs.len() - 1
     }
@@ -584,7 +600,7 @@ impl Front {
         &mut self,
         d: &'a ast::StmtClassDef,
         bodies: &mut Vec<(FuncId, &'a ast::StmtFunctionDef)>,
-        asts: &mut HashMap<ClassId, Vec<(String, &'a ast::StmtFunctionDef)>>,
+        asts: &mut HashMap<ClassId, Vec<(String, &'a ast::StmtFunctionDef, ClassId)>>,
     ) -> Res<()> {
         let cid = self.classes[d.name.id.as_str()];
         if self.p.classes[cid].exc.is_some() {
@@ -664,8 +680,8 @@ impl Front {
             }
         }
         // methods of the base class, compiled again for this class (so that
-        // `self.m()` calls this class's version)
-        let mut map: Vec<(String, &'a ast::StmtFunctionDef)> = match self.p.classes[cid].base {
+        // `self.m()` calls this class's version); entries: (name, ast, class it is written in)
+        let mut map: Vec<(String, &'a ast::StmtFunctionDef, ClassId)> = match self.p.classes[cid].base {
             Some(b) => asts.get(&b).cloned().unwrap_or_default(),
             None => vec![],
         };
@@ -674,8 +690,14 @@ impl Front {
             .iter()
             .filter_map(|s| if let AStmt::FunctionDef(f) = s { Some((f.name.id.to_string(), f)) } else { None })
             .collect();
-        if let Some(b) = self.p.classes[cid].base {
-            for (name, f) in &map {
+        for (n, _) in &own {
+            if let Some(fid) = self.p.classes[cid].method(n) {
+                self.p.funcs[fid].def_class = Some(cid);
+            }
+        }
+        let mut work: Vec<(&'a ast::StmtFunctionDef, ClassId)> = own.iter().map(|(_, f)| (*f, cid)).collect();
+        if self.p.classes[cid].base.is_some() {
+            for (name, f, def) in &map {
                 if own.iter().any(|(n, _)| n == name) {
                     continue;
                 }
@@ -683,35 +705,44 @@ impl Front {
                     return err(self.line(d), "a dataclass cannot inherit an __init__");
                 }
                 let fid = self.signature(f, Some(cid))?;
+                self.p.funcs[fid].def_class = Some(*def);
                 if name == "__init__" {
                     self.p.funcs[fid].is_init = true;
                     self.p.classes[cid].init = Some(fid);
                 }
                 self.p.classes[cid].methods.push((name.clone(), fid));
                 bodies.push((fid, f));
+                work.push((f, *def));
             }
-            // `super().m(...)`: the base's m, compiled for this class
+        }
+        // `super().m(...)` in a method written in class D: D's base's m, compiled
+        // for this class as `<base>_<m>`
+        while let Some((f, def)) = work.pop() {
             let mut used = vec![];
-            for (_, f) in &own {
-                super_calls(&f.body, &mut used);
-            }
+            super_calls(&f.body, &mut used);
             for m in used {
-                if m == "__init__" || self.p.classes[cid].method(&format!("super_{}", m)).is_some() {
+                if m == "__init__" {
                     continue;
                 }
-                let Some((_, bf)) = map.iter().find(|(n, _)| *n == m) else {
+                let Some(b) = self.p.classes[def].base else { continue };
+                let name = format!("{}_{}", snake_name(&self.p.classes[b].name), m);
+                if self.p.classes[cid].method(&name).is_some() {
+                    continue;
+                }
+                let Some((_, bf, bdef)) = asts.get(&b).and_then(|v| v.iter().find(|(n, _, _)| *n == m)).cloned() else {
                     return err(self.line(d), format!("`{}` has no method `{}`", self.p.classes[b].name, m));
                 };
                 let fid = self.signature(bf, Some(cid))?;
-                let name = format!("super_{}", m);
                 self.p.funcs[fid].name = name.clone();
+                self.p.funcs[fid].def_class = Some(bdef);
                 self.p.classes[cid].methods.push((name, fid));
                 bodies.push((fid, bf));
+                work.push((bf, bdef));
             }
         }
         for (n, f) in own {
-            map.retain(|(m, _)| *m != n);
-            map.push((n, f));
+            map.retain(|(m, _, _)| *m != n);
+            map.push((n, f, cid));
         }
         asts.insert(cid, map);
         Ok(())
@@ -726,7 +757,7 @@ impl Front {
             }
             let methods = self.p.classes[c].methods.clone();
             for (name, fid) in methods {
-                if name == "__init__" || name.starts_with("super_") || self.p.funcs[fid].is_static {
+                if name == "__init__" || self.p.funcs[fid].def_class.is_some_and(|d| !self.p.is_sub(c, d) && d != c) || name.contains('_') && self.p.classes.iter().any(|k| name.starts_with(&format!("{}_", snake_name(&k.name)))) || self.p.funcs[fid].is_static {
                     continue;
                 }
                 let proto = self.p.funcs[fid].clone();
@@ -803,10 +834,13 @@ impl Front {
             },
             AExpr::NoneLiteral(_) => Ok(Ty::None),
             AExpr::StringLiteral(s) => {
-                let name = s.value.to_str();
-                match self.classes.get(name) {
-                    Some(id) => Ok(Ty::Class(*id)),
-                    None => err(line, format!("unknown type `{}`", name)),
+                let text = s.value.to_str();
+                match ruff_python_parser::parse_expression(text) {
+                    Ok(p) => {
+                        let inner = p.into_expr();
+                        self.ann(&inner).map_err(|e| Error::new(line, e.msg))
+                    }
+                    Err(_) => err(line, format!("unknown type `{}`", text)),
                 }
             }
             AExpr::Subscript(s) => {
@@ -1124,6 +1158,23 @@ impl Front {
                 StmtKind::Raise(name, msg)
             }
             AStmt::Assert(a) => {
+                // `assert a is not None and b is not None`: one let-else each
+                if let (AExpr::BoolOp(b), None) = (&*a.test, &a.msg) {
+                    let all = b.op == ast::BoolOp::And
+                        && b.values.iter().all(|v| matches!(self.narrowing(v), Some((_, true, ref r, None)) if r.is_empty()));
+                    if all {
+                        for v in &b.values {
+                            let Some((place, _, _, _)) = self.narrowing(v) else { unreachable!() };
+                            let Some((pe, nv)) = self.narrow_var(place, None)? else {
+                                return err(line, "unsupported assert");
+                            };
+                            let raise = self.stmt_(line, StmtKind::Raise("AssertionError".into(), None));
+                            self.push_narrow(&pe, nv);
+                            out.push(self.stmt_(line, StmtKind::LetSome(nv, pe, vec![raise])));
+                        }
+                        return Ok(());
+                    }
+                }
                 if let Some((place, true, rest, None)) = self.narrowing(&a.test) {
                     if rest.is_empty() && a.msg.is_none() {
                         if let Some((pe, v)) = self.narrow_var(place, None)? {
@@ -1206,7 +1257,7 @@ impl Front {
                         }
                     };
                     self.scopes.push(HashMap::new());
-                    let name = h.name.as_ref().map(|n| n.id.to_string()).unwrap_or_else(|| "err".into());
+                    let name = h.name.as_ref().map(|n| n.id.to_string()).unwrap_or_else(|| "caught".into());
                     let v = if h.name.is_some() {
                         self.new_var(&name, Ty::Exc, VarKind::Bound)
                     } else {
@@ -1552,8 +1603,26 @@ impl Front {
 
     /// A condition: any value is converted by its truth value.
     fn cond(&mut self, e: &AExpr) -> Res<Expr> {
-        let ex = self.expr(e, None)?;
-        self.truth(ex)
+        let line = self.line(e);
+        // in a condition only the truth value of `a and b` matters
+        match e {
+            AExpr::BoolOp(b) => {
+                let mut vs = vec![];
+                for v in &b.values {
+                    vs.push(self.cond(v)?);
+                }
+                let k = if b.op == ast::BoolOp::And { ExprKind::And(vs) } else { ExprKind::Or(vs) };
+                Ok(self.mk(line, Ty::Bool, k))
+            }
+            AExpr::UnaryOp(u) if u.op == ast::UnaryOp::Not => {
+                let c = self.cond(&u.operand)?;
+                Ok(self.mk(line, Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(c))))
+            }
+            _ => {
+                let ex = self.expr(e, None)?;
+                self.truth(ex)
+            }
+        }
     }
 
     fn truth(&mut self, e: Expr) -> Res<Expr> {
@@ -1609,7 +1678,7 @@ impl Front {
             AExpr::Name(n) => self.name(n.id.as_str(), line)?,
             AExpr::BinOp(b) => {
                 let op = binop(b.op).ok_or_else(|| Error::new(line, "unsupported operator `@`"))?;
-                let l = self.expr(&b.left, want)?;
+                let l = self.expr(&b.left, None)?;
                 let r = self.expr(&b.right, None)?;
                 self.binary(op, l, r, line)?
             }
@@ -1791,10 +1860,18 @@ impl Front {
         })
     }
 
-    fn hashable(&mut self, t: &Ty, line: u32) -> Res<()> {
+    /// The element type of an empty literal that a builtin needs now: int.
+    fn settle(&mut self, t: &Ty) {
+        if matches!(self.norm(t), Ty::Var(_)) {
+            self.unify(t, &Ty::Int);
+        }
+    }
+
+    fn hashable(&self, t: &Ty, line: u32) -> Res<()> {
         match self.norm(t) {
             Ty::List(_) | Ty::Set(_) | Ty::Dict(..) => err(line, "unhashable type: lists, sets and dicts cannot be keys"),
             Ty::Float => err(line, "float keys are not supported"),
+            Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.hashable(t, line)),
             Ty::Class(_) => err(line, "class instances cannot be keys yet"),
             _ => Ok(()),
         }
@@ -1842,6 +1919,19 @@ impl Front {
             let b = self.coerce(b, &Ty::Float, "")?;
             return Ok((a, b));
         }
+        // two classes: their nearest common base class
+        if let (Ty::Class(x) | Ty::Obj(x), Ty::Class(y) | Ty::Obj(y)) = (&ta, &tb) {
+            let mut c = Some(*x);
+            while let Some(k) = c {
+                if self.p.is_sub(*y, k) {
+                    let t = Ty::Class(k);
+                    let a = self.coerce(a, &t, "value")?;
+                    let b = self.coerce(b, &t, "value")?;
+                    return Ok((a, b));
+                }
+                c = self.p.classes[k].base;
+            }
+        }
         if !self.unify(&ta, &tb) {
             return err(line, format!("branches have different types: {} and {}", self.tn(&ta), self.tn(&tb)));
         }
@@ -1850,6 +1940,18 @@ impl Front {
 
     fn binary(&mut self, op: BinOp, l: Expr, r: Expr, line: u32) -> Res<Expr> {
         use BinOp::*;
+        // an unknown element type (of an empty literal) takes the other operand's
+        match (self.norm(&l.ty), self.norm(&r.ty)) {
+            (Ty::Var(_), Ty::Var(_)) => {
+                self.unify(&l.ty, &Ty::Int);
+                self.unify(&r.ty, &Ty::Int);
+            }
+            (Ty::Var(_), t @ (Ty::Int | Ty::Float | Ty::Str)) | (t @ (Ty::Int | Ty::Float | Ty::Str), Ty::Var(_)) => {
+                self.unify(&l.ty, &t);
+                self.unify(&r.ty, &t);
+            }
+            _ => {}
+        }
         let (lt, rt) = (self.norm(&l.ty), self.norm(&r.ty));
         let bad = |s: &Self| {
             err(line, format!("unsupported operand types for {}: {} and {}", opstr(op), s.tn(&lt), s.tn(&rt)))
@@ -1965,6 +2067,25 @@ impl Front {
                             r
                         }
                     } else {
+                        // `x == y` with x: T | None and y: T compares as Optionals
+                        if matches!(op, CmpOp::Eq | CmpOp::Ne) && !self.unify(&lt, &rt) {
+                            if let Ty::Optional(inner) = &lt {
+                                if self.unify(inner, &rt) {
+                                    let r = self.coerce(r, &lt, "operand")?;
+                                    prev_ty = lt.clone();
+                                    rest.push((op, r));
+                                    continue;
+                                }
+                            }
+                            if let Ty::Optional(inner) = &rt {
+                                if self.unify(inner, &lt) && rest.is_empty() {
+                                    first = self.coerce(first, &rt, "operand")?;
+                                    prev_ty = rt.clone();
+                                    rest.push((op, r));
+                                    continue;
+                                }
+                            }
+                        }
                         if !self.unify(&lt, &rt) {
                             return err(line, format!("cannot compare {} with {}", self.tn(&lt), self.tn(&rt)));
                         }
@@ -1991,6 +2112,8 @@ impl Front {
             Ty::Int | Ty::Float | Ty::Str | Ty::Bool => Ok(()),
             Ty::List(e) => self.orderable(&e, line),
             Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.orderable(t, line)),
+            // elements of an empty literal: settled (as int) at the end
+            Ty::Var(_) => Ok(()),
             t => err(line, format!("{} values cannot be ordered", self.tn(&t))),
         }
     }
@@ -2085,7 +2208,11 @@ impl Front {
                                         }
                                     }
                                 }
-                                let t = self.norm(&e.ty);
+                                if !spec.is_empty() {
+                                    self.settle(&e.ty);
+                                }
+                                let t = if conv.is_some() || i.conversion == ast::ConversionFlag::Str { Ty::Str } else { self.norm(&e.ty) };
+                                let conv = if i.conversion == ast::ConversionFlag::Str && !spec.is_empty() { Some('s') } else { conv };
                                 if !spec.is_empty() {
                                     check_spec(&spec, &t).map_err(|m| Error::new(line, m))?;
                                 }
@@ -2296,15 +2423,24 @@ impl Front {
             bound.extend(vars);
             let mut conds = Vec::new();
             for c in &g.ifs {
+                let cl = self.line(c);
+                if let Some((place, true, rest, cls)) = self.narrowing(c) {
+                    if let Some((pe, v)) = self.narrow_var(place, cls)? {
+                        conds.push(self.narrow_cond(pe, v, &rest, cl)?);
+                        continue;
+                    }
+                }
                 conds.push(self.cond(c)?);
             }
             cgens.push(CompFor { target, iter, conds });
         }
+        let depth0 = self.narrow.len();
         let e = self.expr(elt, None)?;
         let v = match val {
             Some(v) => Some(self.expr(v, None)?),
             None => None,
         };
+        let _ = depth0;
         for _ in gens {
             self.scopes.pop();
         }
@@ -2421,7 +2557,9 @@ impl Front {
                 let (Some(c), Some(sv)) = (self.p.funcs[f].class, self.p.funcs[f].self_var) else {
                     return err(line, "super() outside a method");
                 };
-                let Some(b) = self.p.classes[c].base else { return err(line, "super() in a class without a base class") };
+                // relative to the class the method is written in
+                let def = self.p.funcs[f].def_class.unwrap_or(c);
+                let Some(b) = self.p.classes[def].base else { return err(line, "super() in a class without a base class") };
                 if m == "__init__" {
                     if !self.p.funcs[f].is_init {
                         return err(line, "super().__init__() only inside __init__");
@@ -2432,7 +2570,7 @@ impl Front {
                     let a = self.call_args(binit, args, false, line)?;
                     return Ok(self.mk(line, Ty::None, ExprKind::SuperInit(binit, a)));
                 }
-                let Some(fid) = self.p.classes[c].method(&format!("super_{}", m)) else {
+                let Some(fid) = self.p.classes[c].method(&format!("{}_{}", snake_name(&self.p.classes[b].name), m)) else {
                     return err(line, format!("`{}` has no method `{}`", self.p.classes[b].name, m));
                 };
                 if self.p.funcs[f].is_init {
@@ -2687,6 +2825,7 @@ impl Front {
             "abs" => {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], want)?;
+                self.settle(&x.ty);
                 let t = self.norm(&x.ty);
                 if !t.is_num() {
                     return err(line, format!("bad operand type for abs(): {}", self.tn(&t)));
@@ -2718,7 +2857,9 @@ impl Front {
                 }
                 let mut v = Vec::new();
                 for a in args.args.iter() {
-                    v.push(self.expr(a, want)?);
+                    let x = self.expr(a, want)?;
+                    self.settle(&x.ty);
+                    v.push(x);
                 }
                 let float = v.iter().any(|e| self.norm(&e.ty) == Ty::Float);
                 if float && v.iter().any(|e| self.norm(&e.ty) == Ty::Int) {
@@ -2737,6 +2878,9 @@ impl Front {
                 self.nargs(args, 1, 1, name, line)?;
                 self.kw(args, &[], line)?;
                 let (it, t) = self.iter_arg(&args.args[0])?;
+                if matches!(self.norm(&t), Ty::Var(_)) {
+                    self.unify(&t, &Ty::Int);
+                }
                 if !self.norm(&t).is_num() {
                     return err(line, format!("sum() of {} is not supported", self.tn(&t)));
                 }
@@ -2798,6 +2942,7 @@ impl Front {
             "int" => {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], None)?;
+                self.settle(&x.ty);
                 match self.norm(&x.ty) {
                     Ty::Int => Ok(x),
                     Ty::Float | Ty::Str | Ty::Bool => b(self, "int", Ty::Int, vec![x]),
@@ -2807,6 +2952,7 @@ impl Front {
             "float" => {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], None)?;
+                self.settle(&x.ty);
                 match self.norm(&x.ty) {
                     Ty::Float => Ok(x),
                     Ty::Int => self.coerce(x, &Ty::Float, ""),
@@ -2820,6 +2966,15 @@ impl Front {
             }
             "round" => {
                 self.nargs(args, 1, 2, name, line)?;
+                // round(int, n) is an int
+                let probe = self.expr(&args.args[0], None)?;
+                if self.norm(&probe.ty) == Ty::Int {
+                    if args.args.len() == 1 {
+                        return Ok(probe);
+                    }
+                    let n = self.arg(args, 1, &Ty::Int, "round() digits")?;
+                    return b(self, "round_int", Ty::Int, vec![probe, n]);
+                }
                 let x = self.arg(args, 0, &Ty::Float, "round() argument")?;
                 if args.args.len() == 2 {
                     let n = self.arg(args, 1, &Ty::Int, "round() digits")?;
@@ -2865,6 +3020,14 @@ impl Front {
             "isinstance" => {
                 self.nargs(args, 2, 2, name, line)?;
                 let x = self.expr(&args.args[0], None)?;
+                if self.norm(&x.ty) == Ty::Exc {
+                    let AExpr::Name(n) = &args.args[1] else { return err(line, "isinstance() needs one class") };
+                    if !self.is_exception(n.id.as_str()) {
+                        return err(line, format!("`{}` is not an exception class", n.id));
+                    }
+                    let k = self.mk(line, Ty::Str, ExprKind::Str(n.id.to_string()));
+                    return b(self, "exc.is", Ty::Bool, vec![x, k]);
+                }
                 let d = self.class_arg(&args.args[1], line)?;
                 self.isinstance(x, d, None, line)
             }
@@ -3223,6 +3386,12 @@ impl Front {
 
     /// Resolve all type variables; unresolved ones are errors.
     fn finish(&mut self) -> Res<()> {
+        // nothing constrains the elements of an empty literal: any type is right
+        for t in &mut self.tvars {
+            if t.is_none() {
+                *t = Some(Ty::Int);
+            }
+        }
         let mut p = std::mem::take(&mut self.p);
         let r = (|| {
             for f in &mut p.funcs {

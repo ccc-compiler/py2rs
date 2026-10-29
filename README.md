@@ -42,6 +42,7 @@ cargo build --release
 ./target/release/py2rs build prog.py [-o DIR] # Cargo project, release build
 ./target/release/py2rs run   prog.py          # build (cached) and run
 ./target/release/py2rs test                   # differential test, see below
+./target/release/py2rs fuzz 300               # random programs against CPython
 ```
 
 ## Testing
@@ -50,7 +51,13 @@ cargo build --release
 in one Cargo package and compares stdout, exit code and exception type with CPython
 (`PY2RS_PYTHON`, else python3.14 / 3.13 / 3.12). Input comes from `NAME.in` if present.
 A program whose first line is `# error: TEXT` must be rejected with a message containing
-TEXT (`tests/err/`).
+TEXT (`tests/err/`). The corpus has about 200 programs (algorithms, data processing, object
+oriented code, text and numbers, regressions).
+
+`py2rs fuzz N [SEED]` generates N random well-typed programs (integer division and modulo
+signs, float printing, format specs, slicing, list / dict operations, caught exceptions),
+runs them on CPython and as Rust, and keeps the ones that differ in
+`target/py2rs-cache/fuzz-fail/`.
 
 ## The subset
 

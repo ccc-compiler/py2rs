@@ -1,0 +1,15 @@
+14
+open A1 alice 100000
+open B2 bob 2550
+open C3 carol 123456789
+dep A1 4999
+wd B2 3000
+xfer A1 B2 25000
+xfer C3 Z9 100
+dep B2 -5
+wd C3 100000000
+foo A1 1
+xfer B2 C3 27550
+dep B2 1
+wd A1 79999
+open D4 dave 0

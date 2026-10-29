@@ -1,0 +1,31 @@
+def main() -> None:
+    s = "  Hello, World! Hello again.  "
+    print(repr(s.strip()), repr(s.lstrip()), repr(s.rstrip()))
+    print(s.count("Hello"), s.find("Hello"), s.rfind("Hello"), s.find("xyz"), s.index("World"))
+    print(s.replace("Hello", "Bye"))
+    print(s.split(), s.split(","), s.split("l"))
+    print(s.upper(), s.lower(), s.title(), s.swapcase(), s.strip().capitalize())
+    print("hello".startswith("he"), "hello".endswith("lo"), "hello"[3:].startswith("lo"))
+    print("42".zfill(5), "-42".zfill(6), "abc".zfill(2), "+7".zfill(4))
+    print("[" + "x".center(5) + "]", "[" + "ab".center(7) + "]", "[" + "abc".center(6) + "]")
+    print("[" + "ab".ljust(5) + "]", "[" + "ab".rjust(5) + "]")
+    for t in ["123", "12a", "", " 1", "abc", "ABC", "aBc", "Abc Def", "abc1", "   ", "١٢٣"]:
+        print(repr(t), t.isdigit(), t.isalpha(), t.isalnum(), t.isupper(), t.islower(), t.isspace(), t.isnumeric(), t.isdecimal())
+    print("-".join(["a", "b", "c"]), "".join(reversed("stressed")), ", ".join(str(i) for i in range(5)))
+    print("a,b,,c,".split(","), "a  b \t c\n".split(), "".split(), "".split(","), "x".split("x"))
+    print("line1\nline2\r\nline3".splitlines(), "no newline".splitlines())
+    print("www.example.com"[4:] if "www.example.com".startswith("www.") else "", "file.tar.gz".rsplit(), "abc".casefold())
+    print("xxhixx".strip("x"), "abcba".strip("ab"), "  \t x \n".strip(), "...a.b...".rstrip("."))
+    print("a" * 3 + "b" * 0, "ab" * -1 == "")
+    print("hello world".rfind("o"), "hello world".rindex("l"), "hello"[1:4].upper())
+    print("CamelCaseString".lower(), "snake_case_name".replace("_", " ").title().replace(" ", ""))
+    words = "the rain in spain stays mainly in the plain".split()
+    print(sorted(words), sorted(words, key=lambda w: len(w)), sorted(set(words)), len(set(words)))
+    print(max(words, key=lambda w: len(w)), min(words), [w for w in words if "ain" in w])
+    print(" ".join(w.capitalize() for w in words), sum(len(w) for w in words))
+    print("%" in "100%", "abc" < "abd", "abc" < "ab", "B" < "a", "abc" == "abc")
+    print(str(3) * 3, str(-1.5), str(True), "x" + str([1, 2]), str((1, "a")))
+    print(ord("a") - ord("A"), "".join(chr(ord(c) + 1) for c in "HAL"))
+
+
+main()
