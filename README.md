@@ -39,11 +39,26 @@ fn total(items: &[Item], tax: f64) -> f64 {
 cargo build --release
 ./target/release/py2rs emit  prog.py          # print the Rust program
 ./target/release/py2rs check prog.py          # types + ownership only
+./target/release/py2rs explain prog.py        # parameter modes, references, copies
 ./target/release/py2rs build prog.py [-o DIR] # Cargo project, release build
 ./target/release/py2rs run   prog.py          # build (cached) and run
 ./target/release/py2rs test                   # differential test, see below
 ./target/release/py2rs fuzz 300               # random programs against CPython
 ```
+
+## Ownership annotations
+
+Parameter modes are inferred. To pin one, annotate it (the module `python/rust` makes the
+annotations work under CPython too; put that directory on `PYTHONPATH`):
+
+```python
+from rust import Ref, Mut, Own
+
+def fill(xs: Mut[list[int]], n: int) -> None: ...   # &mut Vec<i64>
+def keep(xs: Own[list[int]]) -> None: ...           # Vec<i64>
+```
+
+An annotation the code contradicts (modifying a `Ref[...]`) is an error.
 
 ## Testing
 
@@ -77,6 +92,8 @@ How the Python constructs map to Rust:
 | `x: T \| None`, `if x is not None:` | `Option<T>`, `if let Some(x) = &x` (also `while let`, let-else, let chains) |
 | `node.next = self.head; self.head = node` | `node.next = self.head.take();` |
 | a local that only reads other objects (`cur = cur.next`) | a reference: `let mut cur = &self.head;` |
+| `item = self.items[k]; item.qty -= 1` | `let item = &mut self.items[k];` |
+| `while cur is not None: ... prev = cur; cur = nxt` | `while let Some(mut node) = cur` (the value moves) |
 | a class with subclasses | an `enum` over the classes that are created; methods dispatch with `match` |
 | `isinstance(s, Circle)` | `if let Shape::Circle(s) = &s` |
 | `super().__init__(...)` | `let (name,) = Shape::init(...)` (the base part of `__init__`) |

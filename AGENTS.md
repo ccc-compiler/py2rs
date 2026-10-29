@@ -72,4 +72,12 @@ Generated projects use edition 2024 (let chains).
   index (`index_mut_code`, `FGen.pre` lines are flushed before each statement);
   `pyrt::catching(|| op)` turns `raise` / panics into `Err` for failing builtins without a
   `try_` variant (`exc::op_kinds` second list; `FGen.in_catching`).
+- v0.4: `own.mut_views` (`mut_view_candidates` → fixpoint → `accepted_mut_views`: modified,
+  never an owned value, `conflicts` = no other use of the borrowed part while live; their
+  `origin` points at the container so mutations count for it), `own.consumed` (narrowed
+  value bound by value when the Optional local is dead at the region start: `consumable`,
+  `bound_in` makes narrowing conditions define their variable for liveness), views also
+  from locals (`assigned_while_live`), `Param.force` (`Ref`/`Mut`/`Own` from
+  `from rust import`, module `python/rust` for CPython; the test runner sets PYTHONPATH),
+  `py2rs explain` (`lib::explain`, copies recorded in `gen::clones`).
 

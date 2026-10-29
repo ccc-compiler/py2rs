@@ -8,13 +8,30 @@ rejection has a test in `tests/err/`.
 | M1 (v0.1) | typed subset, ownership inference, aliasing check, diff test | done |
 | M2 (v0.2) | Optional, inheritance, exceptions | done |
 | v0.3 | reliability: ~150-program corpus, definite assignment, random program fuzzer, CI | done |
-| v0.4 | mutable reference locals, `from rust import Ref, Mut, Own`, `py2rs explain`, `@shared` (`Rc<RefCell>`) | |
+| v0.4 | mutable reference locals, moving out of narrowed values, `from rust import Ref, Mut, Own`, `py2rs explain`, usability batch | done |
 | v0.5 | `from rust.CRATE import X`: Cargo dependencies, rustdoc-JSON stubs, borrow / Result / Option mapping, `rust_inline` | |
 | v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time, os.path, files | |
 | v0.7 | `with`, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | |
-| v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects | |
+| v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | |
 | v0.9 | benchmarks vs CPython, ASCII strings, fewer clones, buffered print, optional bigint / fixed-width ints, CPython set order | |
 | v1.0 | crates.io packages (publish needs the owner's go-ahead), docs in three languages, subset spec, case studies, PyO3 module output | |
+
+## v0.4 result
+
+- `item = self.items[k]; item.qty -= 1` → `let item = &mut self.items[k];` (`own.mut_views`:
+  only assigned from places, modified, never stored, its container untouched meanwhile);
+  trie cursors `node = &mut node.children[&c]`
+- `while cur is not None: ... prev = cur; cur = nxt` → `while let Some(mut node) = cur`
+  (`own.consumed`: the Optional local is not read again before it is reassigned)
+- read-only references now also from locals; `b = a; b.append(x); print(a)` is a true `&mut`
+- `from rust import Ref, Mut, Own` (`python/rust` makes them run under CPython)
+- `py2rs explain FILE`: parameter modes with reasons, references, copies by line
+- usability: `x in ("+", "-")`, `a, b = s.split("/")`, `key=len` / `key=str.lower`,
+  `field(default_factory=list)`, frozen dataclasses as keys, `lo <= f(x) <= hi`,
+  `raise KeyError(42)`, `NameError`, `int(s, base)`, `bin/hex/oct`, `max(.., default=)`,
+  str: maxsplit, replace count, find/count start, partition, removeprefix, fill chars,
+  `math.radians/degrees/isclose`, comprehensions that are only printed
+- `@shared` moved to v0.8
 
 ## v0.3 result
 

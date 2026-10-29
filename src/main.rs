@@ -9,6 +9,7 @@ py2rs: translate a typed subset of Python into readable Rust
 usage:
   py2rs emit  FILE.py              print the Rust program
   py2rs check FILE.py              check only (types, ownership)
+  py2rs explain FILE.py            ownership decisions: parameter modes, references, copies
   py2rs build FILE.py [-o DIR]     write a Cargo project (default FILE_rs/) and build it
   py2rs run   FILE.py [ARGS...]    build (cached) and run
   py2rs test  [FILES|DIRS...]      differential test against CPython (default tests/)
@@ -22,6 +23,7 @@ fn main() {
     let code = match args.first().map(|s| s.as_str()) {
         Some("emit") if args.len() == 2 => emit(&args[1]),
         Some("check") if args.len() == 2 => check(&args[1]),
+        Some("explain") if args.len() == 2 => explain(&args[1]),
         Some("build") if args.len() >= 2 => {
             let out = match args.iter().position(|a| a == "-o") {
                 Some(i) if i + 1 < args.len() => Some(PathBuf::from(&args[i + 1])),
@@ -73,6 +75,26 @@ fn emit(file: &str) -> i32 {
             0
         }
         None => 1,
+    }
+}
+
+fn explain(file: &str) -> i32 {
+    let src = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}: {}", file, e);
+            return 1;
+        }
+    };
+    match py2rs::explain(&src) {
+        Ok(r) => {
+            print!("{}", r);
+            0
+        }
+        Err(e) => {
+            eprint!("{}", e.render(file, &src));
+            1
+        }
     }
 }
 
@@ -220,7 +242,7 @@ fn test(args: &[String]) -> i32 {
                 let (py, dir) = (&py, &dir);
                 sc.spawn(move || {
                     let input = std::fs::read(f.with_extension("in")).unwrap_or_default();
-                    let a = project::run(Command::new(py).arg(f), &input);
+                    let a = project::run(Command::new(py).arg(f).env("PYTHONPATH", project::python_path()), &input);
                     let b = project::run(&mut Command::new(dir.join("target/release").join(name)), &input);
                     (a, b)
                 })
@@ -314,7 +336,7 @@ fn fuzz(n: u64, seed: u64) -> i32 {
             .map(|(f, name)| {
                 let (py, dir) = (&py, &dir);
                 sc.spawn(move || {
-                    let a = project::run(Command::new(py).arg(f), b"");
+                    let a = project::run(Command::new(py).arg(f).env("PYTHONPATH", project::python_path()), b"");
                     let b = project::run(&mut Command::new(dir.join("target/release").join(name)), b"");
                     (a, b)
                 })

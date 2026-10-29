@@ -179,3 +179,23 @@ pub fn perm(n: i64, k: i64) -> i64 {
     }
     (n - k + 1..=n).product()
 }
+
+pub fn radians(x: f64) -> f64 {
+    x * (std::f64::consts::PI / 180.0)
+}
+
+pub fn degrees(x: f64) -> f64 {
+    x * (180.0 / std::f64::consts::PI)
+}
+
+/// `math.isclose(a, b)` with the default tolerances
+pub fn isclose(a: f64, b: f64) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return false;
+    }
+    let d = (a - b).abs();
+    d <= 1e-09 * b.abs() || d <= 1e-09 * a.abs()
+}

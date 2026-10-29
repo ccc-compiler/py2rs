@@ -27,6 +27,7 @@ pub const NOT_IMPLEMENTED_ERROR: &[&str] = &["NotImplementedError", "RuntimeErro
 pub const ASSERTION_ERROR: &[&str] = &["AssertionError", "Exception", "BaseException"];
 pub const ATTRIBUTE_ERROR: &[&str] = &["AttributeError", "Exception", "BaseException"];
 pub const EOF_ERROR: &[&str] = &["EOFError", "Exception", "BaseException"];
+pub const NAME_ERROR: &[&str] = &["NameError", "Exception", "BaseException"];
 pub const STOP_ITERATION: &[&str] = &["StopIteration", "Exception", "BaseException"];
 
 impl PyErr {
@@ -119,6 +120,7 @@ pub fn builtin_chain(name: &str) -> &'static [&'static str] {
         "AttributeError" => ATTRIBUTE_ERROR,
         "EOFError" => EOF_ERROR,
         "StopIteration" => STOP_ITERATION,
+        "NameError" => NAME_ERROR,
         "RuntimeError" => RUNTIME_ERROR,
         _ => EXCEPTION,
     }

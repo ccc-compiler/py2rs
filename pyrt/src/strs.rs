@@ -337,3 +337,223 @@ pub fn chr(i: i64) -> String {
         None => raise("ValueError", "chr() arg not in range(0x110000)"),
     }
 }
+
+/// `int(s, base)`
+pub fn int_str_base(s: &str, base: i64) -> i64 {
+    let bad = || -> ! { raise("ValueError", &format!("invalid literal for int() with base {}: {}", base, crate::str_repr(s))) };
+    if !(base == 0 || (2..=36).contains(&base)) {
+        raise("ValueError", "int() base must be >= 2 and <= 36, or 0");
+    }
+    let t = s.trim_matches(is_space).replace('_', "");
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, &t[..]),
+    };
+    let low = body.to_ascii_lowercase();
+    let (b, digits) = match (base, low.get(..2)) {
+        (16 | 0, Some("0x")) => (16, &low[2..]),
+        (8 | 0, Some("0o")) => (8, &low[2..]),
+        (2 | 0, Some("0b")) => (2, &low[2..]),
+        (0, _) => (10, &low[..]),
+        (b, _) => (b, &low[..]),
+    };
+    if digits.is_empty() {
+        bad();
+    }
+    let mut v: i128 = 0;
+    for c in digits.chars() {
+        let d = c.to_digit(36).filter(|d| (*d as i64) < b).unwrap_or_else(|| bad()) as i128;
+        v = v * b as i128 + d;
+        if v > i64::MAX as i128 + 1 {
+            panic!("attempt to convert with overflow");
+        }
+    }
+    let v = if neg { -v } else { v };
+    i64::try_from(v).unwrap_or_else(|_| panic!("attempt to convert with overflow"))
+}
+
+fn radix(n: i64, prefix: &str, f: fn(u64) -> String) -> String {
+    let m = f(n.unsigned_abs());
+    if n < 0 {
+        format!("-{}{}", prefix, m)
+    } else {
+        format!("{}{}", prefix, m)
+    }
+}
+
+/// `bin(n)`
+pub fn bin(n: i64) -> String {
+    radix(n, "0b", |m| format!("{:b}", m))
+}
+
+/// `oct(n)`
+pub fn oct(n: i64) -> String {
+    radix(n, "0o", |m| format!("{:o}", m))
+}
+
+/// `hex(n)`
+pub fn hex(n: i64) -> String {
+    radix(n, "0x", |m| format!("{:x}", m))
+}
+
+/// `s.split(sep, maxsplit)`
+pub fn split_max(s: &str, sep: &str, max: i64) -> Vec<String> {
+    if sep.is_empty() {
+        raise("ValueError", "empty separator");
+    }
+    if max < 0 {
+        return split(s, sep);
+    }
+    s.splitn(max as usize + 1, sep).map(String::from).collect()
+}
+
+/// `s.rsplit(sep, maxsplit)`
+pub fn rsplit_max(s: &str, sep: &str, max: i64) -> Vec<String> {
+    if sep.is_empty() {
+        raise("ValueError", "empty separator");
+    }
+    let mut v: Vec<String> = if max < 0 {
+        s.rsplit(sep).map(String::from).collect()
+    } else {
+        s.rsplitn(max as usize + 1, sep).map(String::from).collect()
+    };
+    v.reverse();
+    v
+}
+
+/// `s.split(None, maxsplit)` / `s.split(maxsplit=n)`
+pub fn split_ws_max(s: &str, max: i64) -> Vec<String> {
+    if max < 0 {
+        return split_ws(s);
+    }
+    let mut out = vec![];
+    let mut rest = s.trim_start_matches(is_space);
+    while !rest.is_empty() {
+        if out.len() as i64 == max {
+            out.push(rest.to_string());
+            break;
+        }
+        match rest.find(is_space) {
+            Some(i) => {
+                out.push(rest[..i].to_string());
+                rest = rest[i..].trim_start_matches(is_space);
+            }
+            None => {
+                out.push(rest.to_string());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `s.replace(a, b, count)`
+pub fn replace_n(s: &str, a: &str, b: &str, count: i64) -> String {
+    if count < 0 {
+        return s.replace(a, b);
+    }
+    s.replacen(a, b, count as usize)
+}
+
+/// `s.partition(sep)`
+pub fn partition(s: &str, sep: &str) -> (String, String, String) {
+    if sep.is_empty() {
+        raise("ValueError", "empty separator");
+    }
+    match s.split_once(sep) {
+        Some((a, b)) => (a.to_string(), sep.to_string(), b.to_string()),
+        None => (s.to_string(), String::new(), String::new()),
+    }
+}
+
+/// `s.rpartition(sep)`
+pub fn rpartition(s: &str, sep: &str) -> (String, String, String) {
+    if sep.is_empty() {
+        raise("ValueError", "empty separator");
+    }
+    match s.rsplit_once(sep) {
+        Some((a, b)) => (a.to_string(), sep.to_string(), b.to_string()),
+        None => (String::new(), String::new(), s.to_string()),
+    }
+}
+
+pub fn removeprefix(s: &str, p: &str) -> String {
+    s.strip_prefix(p).unwrap_or(s).to_string()
+}
+
+pub fn removesuffix(s: &str, p: &str) -> String {
+    s.strip_suffix(p).unwrap_or(s).to_string()
+}
+
+fn one_char(fill: &str) -> char {
+    let mut it = fill.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => c,
+        _ => raise("TypeError", "The fill character must be exactly one character long"),
+    }
+}
+
+/// `s.center(w, fill)`
+pub fn center_fill(s: &str, width: i64, fill: &str) -> String {
+    let c = one_char(fill);
+    let n = len(s);
+    if width <= n {
+        return s.to_string();
+    }
+    let marg = width - n;
+    let left = marg / 2 + (marg & width & 1);
+    let f = |k: i64| std::iter::repeat(c).take(k as usize).collect::<String>();
+    format!("{}{}{}", f(left), s, f(marg - left))
+}
+
+pub fn ljust_fill(s: &str, width: i64, fill: &str) -> String {
+    let c = one_char(fill);
+    let n = len(s);
+    if width <= n {
+        return s.to_string();
+    }
+    format!("{}{}", s, std::iter::repeat(c).take((width - n) as usize).collect::<String>())
+}
+
+pub fn rjust_fill(s: &str, width: i64, fill: &str) -> String {
+    let c = one_char(fill);
+    let n = len(s);
+    if width <= n {
+        return s.to_string();
+    }
+    format!("{}{}", std::iter::repeat(c).take((width - n) as usize).collect::<String>(), s)
+}
+
+/// `s.find(sub, start)`
+pub fn find_from(s: &str, sub: &str, start: i64) -> i64 {
+    let n = len(s);
+    let st = if start < 0 { (start + n).max(0) } else { start.min(n) } as usize;
+    let off: usize = s.char_indices().nth(st).map(|(b, _)| b).unwrap_or(s.len());
+    match s[off..].find(sub) {
+        Some(b) => st as i64 + s[off..off + b].chars().count() as i64,
+        None => -1,
+    }
+}
+
+/// `s.count(sub, start)`
+pub fn count_from(s: &str, sub: &str, start: i64) -> i64 {
+    let n = len(s);
+    let st = if start < 0 { (start + n).max(0) } else { start.min(n) } as usize;
+    let off: usize = s.char_indices().nth(st).map(|(b, _)| b).unwrap_or(s.len());
+    count_str(&s[off..], sub)
+}
+
+pub fn isascii(s: &str) -> bool {
+    s.is_ascii()
+}
+
+/// `a, b = xs` for a list: Python's length errors
+pub fn unpack_len(n: usize, want: usize) {
+    if n < want {
+        raise("ValueError", &format!("not enough values to unpack (expected {}, got {})", want, n));
+    }
+    if n > want {
+        raise("ValueError", &format!("too many values to unpack (expected {}, got {})", want, n));
+    }
+}

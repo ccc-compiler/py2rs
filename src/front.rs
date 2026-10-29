@@ -103,7 +103,7 @@ fn place_key(e: &Expr) -> Option<(VarId, Vec<String>)> {
 pub const EXCEPTIONS: &[&str] = &[
     "Exception", "ValueError", "TypeError", "IndexError", "KeyError", "RuntimeError",
     "ZeroDivisionError", "AssertionError", "NotImplementedError", "ArithmeticError",
-    "OverflowError", "LookupError", "StopIteration", "AttributeError", "EOFError", "BaseException",
+    "OverflowError", "LookupError", "StopIteration", "AttributeError", "EOFError", "BaseException", "NameError",
 ];
 
 fn snake_name(n: &str) -> String {
@@ -326,6 +326,16 @@ impl Front {
                         "dataclasses" | "typing" | "__future__" => {
                             for a in &i.names {
                                 self.imports.insert(a.name.id.to_string());
+                            }
+                        }
+                        // ownership annotations
+                        "rust" => {
+                            for a in &i.names {
+                                let n = a.name.id.as_str();
+                                if !["Ref", "Mut", "Own"].contains(&n) {
+                                    return err(self.line(s), format!("`rust.{}` is not available", n));
+                                }
+                                self.imports.insert(n.to_string());
                             }
                         }
                         _ => return err(self.line(s), format!("module `{}` is not supported", m)),
@@ -569,7 +579,25 @@ impl Front {
             let Some(a) = &p.parameter.annotation else {
                 return err(self.line(&p.parameter), format!("parameter `{}` needs a type annotation", name));
             };
+            // Ref[T] / Mut[T] / Own[T]
+            let (a, force): (&AExpr, Option<Force>) = match &**a {
+                AExpr::Subscript(sub) => match &*sub.value {
+                    AExpr::Name(n) if self.imports.contains(n.id.as_str()) && ["Ref", "Mut", "Own"].contains(&n.id.as_str()) => {
+                        let f = match n.id.as_str() {
+                            "Ref" => Force::Ref,
+                            "Mut" => Force::Mut,
+                            _ => Force::Own,
+                        };
+                        (&*sub.slice, Some(f))
+                    }
+                    _ => (&**a, None),
+                },
+                _ => (&**a, None),
+            };
             let ty = self.ann(a)?;
+            if force.is_some() && ty.is_copy() {
+                return err(self.line(&p.parameter), "Ref / Mut / Own are for lists, dicts, sets, str and objects");
+            }
             let default = match &p.default {
                 Some(e) => {
                     let ex = self.expr(e, Some(&ty))?;
@@ -583,7 +611,7 @@ impl Front {
                 None => None,
             };
             let v = self.new_var(name, ty, VarKind::Param);
-            self.p.funcs[fid].params.push(Param { var: v, default });
+            self.p.funcs[fid].params.push(Param { var: v, default, force });
         }
         if class.is_some() && !is_static && self.p.funcs[fid].self_var.is_none() {
             return err(line, "methods need a `self` parameter");
@@ -641,7 +669,29 @@ impl Front {
                     };
                     self.enter(main);
                     let ty = self.ann(&a.annotation)?;
+                    let factory = match a.value.as_deref() {
+                        Some(AExpr::Call(c)) if matches!(&*c.func, AExpr::Name(n) if n.id.as_str() == "field") => {
+                            match c.arguments.keywords.first().map(|k| (k.arg.as_ref().map(|i| i.id.as_str()), &k.value)) {
+                                Some((Some("default_factory"), AExpr::Name(f))) if c.arguments.keywords.len() == 1 && c.arguments.args.is_empty() => {
+                                    Some(f.id.to_string())
+                                }
+                                _ => return err(self.line(s), "only field(default_factory=list / dict / set) is supported"),
+                            }
+                        }
+                        _ => None,
+                    };
                     let default = match &a.value {
+                        // a fresh empty container for every object
+                        Some(_) if factory.is_some() => {
+                            let l = self.line(s);
+                            let k = match (factory.as_deref(), self.norm(&ty)) {
+                                (Some("list"), Ty::List(_)) => ExprKind::List(vec![]),
+                                (Some("dict"), Ty::Dict(..)) => ExprKind::Dict(vec![]),
+                                (Some("set"), Ty::Set(_)) => ExprKind::Set(vec![]),
+                                _ => return err(l, "default_factory must match the field type (list, dict or set)"),
+                            };
+                            Some(self.mk(l, ty.clone(), k))
+                        }
                         Some(v) => {
                             if !is_const_expr(v, &self.consts) {
                                 return err(self.line(s), "field defaults must be constants");
@@ -785,7 +835,7 @@ impl Front {
                 vars.push(sv);
                 for q in &orig.params {
                     vars.push(orig.vars[q.var].clone());
-                    params.push(Param { var: vars.len() - 1, default: q.default.clone() });
+                    params.push(Param { var: vars.len() - 1, default: q.default.clone(), force: q.force });
                 }
                 f.vars = vars;
                 f.params = params;
@@ -1148,10 +1198,20 @@ impl Front {
                 if !self.is_exception(&name) {
                     return err(line, format!("unknown exception `{}`", name));
                 }
+                // str(e) is str(arg); for KeyError it is repr(arg)
+                let key = crate::exc::chain(&self.p, &name).iter().any(|k| k == "KeyError");
                 let msg = match arg {
                     Some(a) => {
-                        let e = self.expr(a, Some(&Ty::Str))?;
-                        Some(self.coerce(e, &Ty::Str, "exception message")?)
+                        let e = self.expr(a, None)?;
+                        self.printable(&e.ty, line)?;
+                        let l = e.line;
+                        if key {
+                            Some(self.mk(l, Ty::Str, ExprKind::Builtin("repr", vec![e])))
+                        } else if self.norm(&e.ty) == Ty::Str {
+                            Some(e)
+                        } else {
+                            Some(self.mk(l, Ty::Str, ExprKind::Builtin("str", vec![e])))
+                        }
                     }
                     None => None,
                 };
@@ -1477,6 +1537,16 @@ impl Front {
                     AExpr::List(l) => &l.elts,
                     _ => unreachable!(),
                 };
+                // `a, b = xs` (a list): checked at run time like Python
+                if let Ty::List(et) = self.norm(ty) {
+                    let n = elts.len();
+                    let tt = Ty::Tuple(vec![(*et).clone(); n]);
+                    let e = std::mem::replace(val, self.mk(line, Ty::None, ExprKind::NoneLit));
+                    let k = self.mk(line, Ty::Int, ExprKind::Int(n as i64));
+                    *val = self.mk(line, tt.clone(), ExprKind::Builtin("unpack", vec![e, k]));
+                    let mut dummy = self.mk(line, Ty::None, ExprKind::NoneLit);
+                    return self.target(t, &tt, declared, &mut dummy, line);
+                }
                 let Ty::Tuple(ts) = self.norm(ty) else {
                     return err(line, "only tuples can be unpacked");
                 };
@@ -1872,7 +1942,14 @@ impl Front {
             Ty::List(_) | Ty::Set(_) | Ty::Dict(..) => err(line, "unhashable type: lists, sets and dicts cannot be keys"),
             Ty::Float => err(line, "float keys are not supported"),
             Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.hashable(t, line)),
-            Ty::Class(_) => err(line, "class instances cannot be keys yet"),
+            Ty::Class(c) => {
+                let cl = &self.p.classes[c];
+                if cl.dataclass && cl.frozen && cl.subs.is_empty() {
+                    cl.fields.iter().try_for_each(|f| self.hashable(&f.ty, line))
+                } else {
+                    err(line, "only frozen dataclasses (without subclasses) can be keys")
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -2046,6 +2123,7 @@ impl Front {
                     let elem = match &rt {
                         Ty::List(t) | Ty::Set(t) | Ty::Dict(t, _) => (**t).clone(),
                         Ty::Str => Ty::Str,
+                        Ty::Tuple(ts) if ts.windows(2).all(|w| w[0] == w[1]) => ts[0].clone(),
                         _ => return err(line, format!("`in` needs a list, set, dict or str, not {}", self.tn(&rt))),
                     };
                     if rest.is_empty() {
@@ -2496,7 +2574,55 @@ impl Front {
 
     fn lambda(&mut self, e: &AExpr, params: &[Ty]) -> Res<Expr> {
         let line = self.line(e);
-        let AExpr::Lambda(l) = e else { return err(line, "expected a lambda") };
+        // key=len, key=abs, key=str.lower, ...: a lambda calling it
+        let builtin = match e {
+            AExpr::Name(n) if self.lookup(n.id.as_str()).is_none() && ["len", "abs", "str", "int", "float"].contains(&n.id.as_str()) => Some((None, n.id.to_string())),
+            AExpr::Attribute(a) if matches!(&*a.value, AExpr::Name(n) if n.id.as_str() == "str") => Some((Some("str"), a.attr.id.to_string())),
+            _ => None,
+        };
+        if let (Some((recv, f)), [t]) = (builtin, params) {
+            self.scopes.push(HashMap::new());
+            let vars = &mut self.p.funcs[self.cur].vars;
+            vars.push(Var { name: "x".into(), ty: t.clone(), kind: VarKind::Bound });
+            let v = vars.len() - 1;
+            self.scopes.last_mut().unwrap().insert("\u{0}x".into(), v);
+            self.active.insert(v);
+            let xe = self.mk(line, t.clone(), ExprKind::Var(v));
+            let body = match recv {
+                None => {
+                    let fake = ast::Arguments { range: Default::default(), node_index: Default::default(), args: Default::default(), keywords: Default::default() };
+                    let _ = fake;
+                    match f.as_str() {
+                        "len" => self.mk(line, Ty::Int, ExprKind::Builtin("len", vec![xe])),
+                        "abs" => {
+                            let t2 = self.norm(t);
+                            self.mk(line, t2, ExprKind::Builtin("abs", vec![xe]))
+                        }
+                        "str" => self.mk(line, Ty::Str, ExprKind::Builtin("str", vec![xe])),
+                        "float" => self.coerce(xe, &Ty::Float, "key")?,
+                        _ => xe,
+                    }
+                }
+                Some(_) => {
+                    if self.norm(t) != Ty::Str {
+                        return err(line, "str methods as key= need str items");
+                    }
+                    let n: &'static str = match f.as_str() {
+                        "lower" => "str.lower",
+                        "upper" => "str.upper",
+                        "casefold" => "str.casefold",
+                        "strip" => "str.strip",
+                        _ => return err(line, format!("key=str.{} is not supported", f)),
+                    };
+                    self.mk(line, Ty::Str, ExprKind::Builtin(n, vec![xe]))
+                }
+            };
+            self.scopes.pop();
+            self.active.remove(&v);
+            let bt = body.ty.clone();
+            return Ok(self.mk(line, bt, ExprKind::Lambda(vec![v], Box::new(body))));
+        }
+        let AExpr::Lambda(l) = e else { return err(line, "key= needs a lambda or a function like len") };
         let names: Vec<&str> = match &l.parameters {
             Some(p) => {
                 if p.vararg.is_some() || p.kwarg.is_some() || !p.kwonlyargs.is_empty() {
@@ -2833,7 +2959,7 @@ impl Front {
                 b(self, "abs", t, vec![x])
             }
             "min" | "max" => {
-                let kws = self.kw(args, &["key"], line)?;
+                let kws = self.kw(args, &["key", "default"], line)?;
                 if args.args.is_empty() {
                     return err(line, format!("{}() needs arguments", name));
                 }
@@ -2850,6 +2976,14 @@ impl Front {
                             self.mk(line, Ty::None, K::NoneLit)
                         }
                     };
+                    if let Some(d) = kws.get("default") {
+                        if kws.contains_key("key") {
+                            return err(line, "key= together with default= is not supported");
+                        }
+                        let dv = self.expr(d, Some(&t))?;
+                        let dv = self.coerce(dv, &t, "default")?;
+                        return b(self, if name == "min" { "min_or" } else { "max_or" }, t, vec![it, dv]);
+                    }
                     return b(self, if name == "min" { "min_iter" } else { "max_iter" }, t, vec![it, key]);
                 }
                 if !kws.is_empty() {
@@ -2939,6 +3073,11 @@ impl Front {
                 self.printable(&x.ty, line)?;
                 b(self, if name == "str" { "str" } else { "repr" }, Ty::Str, vec![x])
             }
+            "int" if args.args.len() == 2 => {
+                let x = self.arg(args, 0, &Ty::Str, "int() argument")?;
+                let base = self.arg(args, 1, &Ty::Int, "int() base")?;
+                b(self, "int_base", Ty::Int, vec![x, base])
+            }
             "int" => {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], None)?;
@@ -2995,6 +3134,16 @@ impl Front {
                 let y = self.arg(args, 1, &Ty::Int, "pow() argument")?;
                 let m = self.arg(args, 2, &Ty::Int, "pow() argument")?;
                 b(self, "powmod", Ty::Int, vec![x, y, m])
+            }
+            "bin" | "hex" | "oct" => {
+                self.nargs(args, 1, 1, name, line)?;
+                let x = self.arg(args, 0, &Ty::Int, &format!("{}() argument", name))?;
+                let n: &'static str = match name {
+                    "bin" => "bin",
+                    "hex" => "hex",
+                    _ => "oct",
+                };
+                b(self, n, Ty::Str, vec![x])
             }
             "ord" => {
                 self.nargs(args, 1, 1, name, line)?;
@@ -3123,6 +3272,8 @@ impl Front {
                 }
             }
             "atan2" | "hypot" | "pow" | "fmod" | "copysign" => (leak(format!("math.{}", name)), vec![Ty::Float, Ty::Float], Ty::Float),
+            "radians" | "degrees" => (leak(format!("math.{}", name)), vec![Ty::Float], Ty::Float),
+            "isclose" => ("math.isclose", vec![Ty::Float, Ty::Float], Ty::Bool),
             "floor" | "ceil" | "trunc" => (leak(format!("math.{}", name)), vec![Ty::Float], Ty::Int),
             "gcd" | "lcm" => (leak(format!("math.{}", name)), vec![Ty::Int, Ty::Int], Ty::Int),
             "isqrt" | "factorial" => (leak(format!("math.{}", name)), vec![Ty::Int], Ty::Int),
@@ -3347,6 +3498,30 @@ impl Front {
     }
 
     fn str_method(&mut self, recv: Expr, m: &str, args: &ast::Arguments, line: u32) -> Res<Expr> {
+        // split(maxsplit=n), split(sep, n), rsplit(sep, n)
+        if matches!(m, "split" | "rsplit") {
+            let kws = self.kw(args, &["sep", "maxsplit"], line)?;
+            if !kws.is_empty() || args.args.len() == 2 {
+                let sep: Option<&AExpr> = args.args.first().or(kws.get("sep").copied());
+                let max = match args.args.get(1).or(kws.get("maxsplit").copied()) {
+                    Some(a) => {
+                        let e = self.expr(a, Some(&Ty::Int))?;
+                        self.coerce(e, &Ty::Int, "maxsplit")?
+                    }
+                    _ => self.mk(line, Ty::Int, ExprKind::Int(-1)),
+                };
+                let ls = Ty::list(Ty::Str);
+                return match sep {
+                    Some(AExpr::NoneLiteral(_)) | None => Ok(self.mk(line, ls, ExprKind::Builtin("str.split_ws_max", vec![recv, max]))),
+                    Some(a) => {
+                        let e = self.expr(a, Some(&Ty::Str))?;
+                        let e = self.coerce(e, &Ty::Str, "separator")?;
+                        let f: &'static str = if m == "split" { "str.split_max" } else { "str.rsplit_max" };
+                        Ok(self.mk(line, ls, ExprKind::Builtin(f, vec![recv, e, max])))
+                    }
+                };
+            }
+        }
         self.kw(args, &[], line)?;
         let n = args.args.len();
         let s = Ty::Str;
@@ -3359,6 +3534,13 @@ impl Front {
             ("rsplit", 0) => ("str.split_ws", vec![], Ty::list(s.clone())),
             ("splitlines", 0) => ("str.splitlines", vec![], Ty::list(s.clone())),
             ("replace", 2) => ("str.replace", vec![s.clone(), s.clone()], s.clone()),
+            ("replace", 3) => ("str.replace_n", vec![s.clone(), s.clone(), Ty::Int], s.clone()),
+            ("rsplit", 1) => ("str.rsplit_all", vec![s.clone()], Ty::list(s.clone())),
+            ("find" | "count", 2) => (leak(format!("str.{}_from", m)), vec![s.clone(), Ty::Int], Ty::Int),
+            ("partition" | "rpartition", 1) => (leak(format!("str.{}", m)), vec![s.clone()], Ty::Tuple(vec![s.clone(), s.clone(), s.clone()])),
+            ("removeprefix" | "removesuffix", 1) => (leak(format!("str.{}", m)), vec![s.clone()], s.clone()),
+            ("center" | "ljust" | "rjust", 2) => (leak(format!("str.{}_fill", m)), vec![Ty::Int, s.clone()], s.clone()),
+            ("isascii", 0) => ("str.isascii", vec![], Ty::Bool),
             ("startswith" | "endswith", 1) => (leak(format!("str.{}", m)), vec![s.clone()], Ty::Bool),
             ("find" | "rfind" | "index" | "rindex" | "count", 1) => (leak(format!("str.{}", m)), vec![s.clone()], Ty::Int),
             ("isdigit" | "isalpha" | "isalnum" | "isspace" | "isupper" | "islower" | "isdecimal" | "isnumeric", 0) => {

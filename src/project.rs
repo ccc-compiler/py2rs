@@ -55,6 +55,11 @@ pub fn build(dir: &Path, name: &str, target: &Path, quiet: bool) -> Result<PathB
     Ok(target.join("release").join(name))
 }
 
+/// Where the `rust` annotation module lives (for running the Python side).
+pub fn python_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("python")
+}
+
 /// The Python used as the reference (`PY2RS_PYTHON`, else python3).
 pub fn python() -> String {
     if let Ok(p) = std::env::var("PY2RS_PYTHON") {

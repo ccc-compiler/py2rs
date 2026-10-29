@@ -917,6 +917,24 @@ pub fn min_by_key<T, K: PyOrd, I: IntoIterator<Item = T>>(it: I, key: impl Fn(&T
     best.unwrap_or_else(|| raise("ValueError", "min() iterable argument is empty")).1
 }
 
+/// `max(it, default=d)`
+pub fn max_or<T: PyOrd, I: IntoIterator<Item = T>>(it: I, d: T) -> T {
+    let mut it = it.into_iter().peekable();
+    if it.peek().is_none() {
+        return d;
+    }
+    max(it)
+}
+
+/// `min(it, default=d)`
+pub fn min_or<T: PyOrd, I: IntoIterator<Item = T>>(it: I, d: T) -> T {
+    let mut it = it.into_iter().peekable();
+    if it.peek().is_none() {
+        return d;
+    }
+    min(it)
+}
+
 /// `max(a, b)` on floats (the first unless the second is larger)
 pub fn fmax(a: f64, b: f64) -> f64 {
     if b > a {
@@ -985,4 +1003,25 @@ pub fn sorted_by_key_rev<T, K: PyOrd, I: IntoIterator<Item = T>>(it: I, key: imp
     let mut v: Vec<T> = it.into_iter().collect();
     sort_by_key_rev(&mut v, key);
     v
+}
+
+/// `a, b = xs` for a list
+pub fn unpack2<T>(v: Vec<T>) -> (T, T) {
+    unpack_len(v.len(), 2);
+    let mut it = v.into_iter();
+    (it.next().unwrap(), it.next().unwrap())
+}
+
+/// `a, b, c = xs`
+pub fn unpack3<T>(v: Vec<T>) -> (T, T, T) {
+    unpack_len(v.len(), 3);
+    let mut it = v.into_iter();
+    (it.next().unwrap(), it.next().unwrap(), it.next().unwrap())
+}
+
+/// `a, b, c, d = xs`
+pub fn unpack4<T>(v: Vec<T>) -> (T, T, T, T) {
+    unpack_len(v.len(), 4);
+    let mut it = v.into_iter();
+    (it.next().unwrap(), it.next().unwrap(), it.next().unwrap(), it.next().unwrap())
 }

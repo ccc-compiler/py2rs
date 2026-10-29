@@ -89,7 +89,10 @@ pub fn op_kinds(e: &Expr) -> (Vec<&'static str>, Vec<&'static str>) {
             "math.exp" | "math.floor" | "math.ceil" | "math.trunc" | "round" | "math.sinh" | "math.cosh" => {
                 (vec![], vec!["ValueError", "OverflowError"])
             }
-            "ord" => (vec![], vec!["TypeError"]),
+            "ord" | "str.center_fill" | "str.ljust_fill" | "str.rjust_fill" => (vec![], vec!["TypeError"]),
+            "unpack" | "int_base" | "str.split_max" | "str.rsplit_max" | "str.rsplit_all" | "str.partition" | "str.rpartition" => {
+                (vec![], vec!["ValueError"])
+            }
             "input" => (vec![], vec!["EOFError"]),
             "list.swap" => (vec![], vec!["IndexError"]),
             _ => (vec![], vec![]),

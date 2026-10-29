@@ -306,6 +306,15 @@ pub struct Var {
 pub struct Param {
     pub var: VarId,
     pub default: Option<Expr>,
+    /// `Ref[T]` / `Mut[T]` / `Own[T]` from `from rust import ...`
+    pub force: Option<Force>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Force {
+    Ref,
+    Mut,
+    Own,
 }
 
 #[derive(Clone, Debug)]

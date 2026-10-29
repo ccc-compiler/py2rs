@@ -92,6 +92,20 @@ pub fn rty(t: &Ty, p: &Program) -> String {
     }
 }
 
+/// Can it be a set member / dict key (Eq + Hash)?
+fn hashable_ty(t: &Ty, p: &Program) -> bool {
+    match t {
+        Ty::Int | Ty::Bool | Ty::Str => true,
+        Ty::Tuple(ts) => ts.iter().all(|t| hashable_ty(t, p)),
+        Ty::Optional(t) => hashable_ty(t, p),
+        Ty::Class(c) => {
+            let k = &p.classes[*c];
+            k.dataclass && k.frozen && k.subs.is_empty() && k.fields.iter().all(|f| hashable_ty(&f.ty, p))
+        }
+        _ => false,
+    }
+}
+
 /// The struct of a class's own objects (a class with subclasses is an enum).
 pub fn struct_name(p: &Program, c: ClassId) -> String {
     if p.classes[c].subs.is_empty() {
@@ -315,11 +329,19 @@ thread_local! {
     static PYERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// user exception classes raised as PyErr
     static EXC_USED: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+    /// copies the generated code makes: (function, line, what)
+    static CLONES: std::cell::RefCell<Vec<(FuncId, u32, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The copies (`.clone()`, `.to_vec()`, `.to_string()`) made by the last `generate`.
+pub fn clones() -> Vec<(FuncId, u32, String)> {
+    CLONES.with(|c| c.borrow().clone())
 }
 
 pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     OR_RAISE.with(|c| c.set(false));
     PYERR.with(|c| c.set(false));
+    CLONES.with(|c| c.borrow_mut().clear());
     EXC_USED.with(|c| c.borrow_mut().clear());
     let mut out = String::new();
     for c in &p.consts {
@@ -490,7 +512,14 @@ fn gen_class(
         return Ok(out);
     }
     let sname = struct_name(p, ci);
-    let derives = if c.dataclass { "Clone, Debug, PartialEq" } else { "Clone, Debug" };
+    let hashable = c.dataclass && c.frozen && c.subs.is_empty() && c.fields.iter().all(|f| hashable_ty(&f.ty, p));
+    let derives = if hashable {
+        "Clone, Debug, PartialEq, Eq, Hash"
+    } else if c.dataclass {
+        "Clone, Debug, PartialEq"
+    } else {
+        "Clone, Debug"
+    };
     out += &format!("#[derive({})]\npub struct {} {{\n", derives, sname);
     for f in &c.fields {
         let t = rty(&f.ty, p);
@@ -1333,9 +1362,10 @@ impl<'a> FGen<'a> {
             if self.declared.insert(v) {
                 let m = if self.muts.contains(&v) { "mut " } else { "" };
                 let view = self.o.views[self.fid].contains(&v);
-                let amp = if view { "&" } else { "" };
+                let mview = self.o.mut_views[self.fid].contains(&v);
+                let amp = if mview { "&mut " } else if view { "&" } else { "" };
                 out.push_str(&format!("{}let {}{}: {}{};\n", ind, m, self.name(v), amp, self.ty(&self.f.vars[v].ty)));
-                self.kinds.insert(v, if view { Kind::Ref } else { Kind::Place });
+                self.kinds.insert(v, if mview { Kind::Mut } else if view { Kind::Ref } else { Kind::Place });
             }
         }
     }
@@ -1810,6 +1840,20 @@ impl<'a> FGen<'a> {
                     out.push_str(&format!("{}let _ = {};\n", ind, val));
                 }
             }
+            Target::Var(w) if self.o.mut_views[self.fid].contains(w) => {
+                // a mutable reference into a container
+                let x = self.ex_mut(v)?;
+                let val = self.mut_ref_of(&x);
+                let name = self.name(*w);
+                if self.decl.get(w) == Some(&Decl::At(s.id)) && !self.declared.contains(w) {
+                    self.declared.insert(*w);
+                    self.kinds.insert(*w, Kind::Mut);
+                    let m = if self.muts.contains(w) && assign_count(&self.f.body, *w, &self.o.live_out) > 1 { "mut " } else { "" };
+                    out.push_str(&format!("{}let {}{} = {};\n", ind, m, name, val));
+                } else {
+                    out.push_str(&format!("{}{} = {};\n", ind, name, val));
+                }
+            }
             Target::Var(w) => {
                 let view = self.o.views[self.fid].contains(w);
                 let val = if view { self.borrow(v)? } else { self.owned(v)? };
@@ -2147,7 +2191,17 @@ impl<'a> FGen<'a> {
             }
         }
         let name = self.name(v);
-        let (src, k) = if ty.is_copy() {
+        let (src, k) = if self.o.consumed[self.fid].contains(&v) {
+            // takes the value: `while let Some(mut node) = cur`
+            if let Ty::Class(c) = ty {
+                if recursive(self.p, c) {
+                    self.boxed.insert(v);
+                }
+            }
+            self.kinds.insert(v, Kind::Place);
+            let m = if self.o.via[self.fid].contains(&v) { "mut " } else { "" };
+            return Ok(format!("let Some({}{}) = {}", m, name, p.code));
+        } else if ty.is_copy() {
             (self.val_r(p).code, Kind::Place)
         } else if self.o.via[self.fid].contains(&v) {
             (match p.kind {
@@ -2203,7 +2257,12 @@ impl<'a> FGen<'a> {
                 _ => format!("std::mem::take({})", self.mut_ref_of(&x)),
             });
         }
-        Ok(self.owned_r(&x, &e.ty, self.o.moves.contains(&e.id)))
+        let code = self.owned_r(&x, &e.ty, self.o.moves.contains(&e.id));
+        if (code.ends_with(".clone()") || code.ends_with(".to_vec()") || code.ends_with(".to_string()")) && !matches!(e.kind, ExprKind::Str(_) | ExprKind::Const(_)) {
+            let what = code.trim_end_matches(".clone()").trim_end_matches(".to_vec()").trim_end_matches(".to_string()").to_string();
+            CLONES.with(|c| c.borrow_mut().push((self.fid, e.line, what)));
+        }
+        Ok(code)
     }
 
     fn owned_r(&self, x: &R, t: &Ty, moved: bool) -> String {
@@ -2212,6 +2271,7 @@ impl<'a> FGen<'a> {
         }
         match x.kind {
             Kind::Val => x.code.clone(),
+            Kind::Place if x.boxed && moved => format!("*{}", par(x, UNARY)),
             Kind::Place if x.boxed => format!("(*{}).clone()", par(x, UNARY)),
             Kind::Place if moved => x.code.clone(),
             Kind::Place => format!("{}.clone()", par(x, ATOM)),
@@ -2337,6 +2397,9 @@ impl<'a> FGen<'a> {
                 let b = self.p.funcs[*fid].class.unwrap();
                 let a = self.args(*fid, args)?;
                 r(self.call_result(*fid, format!("{}::init({})", self.p.classes[b].name, a)), Kind::Val, ATOM)
+            }
+            K::SomeOf(x) if matches!(x.kind, K::Var(v) if self.boxed.contains(&v) && self.kind_of(v) == Kind::Place && self.o.moves.contains(&x.id)) => {
+                r(format!("Some({})", self.name(match x.kind { K::Var(v) => v, _ => unreachable!() })), Kind::Val, ATOM)
             }
             K::SomeOf(x) => {
                 let v = self.owned(x)?;
@@ -2603,10 +2666,7 @@ impl<'a> FGen<'a> {
 
     /// `raise K(msg)`
     fn raise_code(&mut self, kind: &str, msg: Option<&Expr>) -> Res<String> {
-        // str(KeyError(k)) is repr(k)
-        let key = exc::chain(self.p, kind).iter().any(|k| k == "KeyError");
         let m = match msg {
-            Some(m) if key => format!("&pyrt::repr({})", self.borrow_str(m)?),
             Some(m) => self.borrow_str(m)?,
             None => "\"\"".into(),
         };
@@ -2872,6 +2932,40 @@ impl<'a> FGen<'a> {
     fn compare(&mut self, first: &Expr, rest: &[(CmpOp, Expr)]) -> Res<R> {
         let mut parts = vec![];
         let mut left = first;
+        // `lo <= f(x) <= hi`: a computed middle operand is evaluated once
+        if rest.len() > 1 && rest[..rest.len() - 1].iter().any(|(_, m)| !is_simple(m)) {
+            if !rest.iter().all(|(_, e)| e.ty.is_copy()) || !first.ty.is_copy() || rest.iter().any(|(op, _)| matches!(op, CmpOp::In | CmpOp::NotIn)) {
+                return err(first.line, "chained comparisons of non-number values need a simple middle operand");
+            }
+            let mut lets = vec![];
+            let mut names = vec![self.val(first)?.code];
+            for (i, (_, e)) in rest.iter().enumerate() {
+                let c = self.val(e)?.code;
+                if i + 1 < rest.len() && !is_simple(e) {
+                    self.tmp += 1;
+                    let t = format!("mid{}", self.tmp);
+                    lets.push(format!("let {} = {};", t, c));
+                    names.push(t);
+                } else {
+                    names.push(c);
+                }
+            }
+            let mut ps = vec![];
+            for (i, (op, _)) in rest.iter().enumerate() {
+                let sym = match op {
+                    CmpOp::Eq => "==",
+                    CmpOp::Ne => "!=",
+                    CmpOp::Lt => "<",
+                    CmpOp::Le => "<=",
+                    CmpOp::Gt => ">",
+                    _ => ">=",
+                };
+                let l = &names[i];
+                let l = if l.ends_with(" as i64") || l.ends_with(" as f64") { format!("({})", l) } else { l.clone() };
+                ps.push(format!("{} {} {}", l, sym, names[i + 1]));
+            }
+            return Ok(r(format!("{{ {} {} }}", lets.join(" "), ps.join(" && ")), Kind::Val, ATOM));
+        }
         for (i, (op, right)) in rest.iter().enumerate() {
             if i > 0 && !is_simple(left) {
                 return err(left.line, "chained comparisons need a simple middle operand");
@@ -2913,6 +3007,30 @@ impl<'a> FGen<'a> {
                     Ty::Set(_) => {
                         let x = self.borrow(a)?;
                         format!("{}.contains({})", par(&c, ATOM), x)
+                    }
+                    Ty::Tuple(_) => {
+                        // `x in ("+", "-")`
+                        let ExprKind::Tuple(items) = &b.kind else {
+                            let x = self.borrow(a)?;
+                            return Ok(r(format!("{}[{}].contains({})", neg, c.code.trim_start_matches('(').trim_end_matches(')'), x), Kind::Val, ATOM));
+                        };
+                        let lits = items.iter().all(|i| matches!(i.kind, ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Bool(_)));
+                        if lits {
+                            let x = self.ex(a)?;
+                            let subject = if a.ty == Ty::Str { format!("&{}[..]", par(&x, ATOM)) } else { self.val_r(x).code };
+                            let mut pats = vec![];
+                            for i in items {
+                                pats.push(self.ex(i)?.code);
+                            }
+                            format!("matches!({}, {})", subject, pats.join(" | "))
+                        } else {
+                            let x = self.borrow(a)?;
+                            let mut els = vec![];
+                            for i in items {
+                                els.push(self.owned(i)?);
+                            }
+                            format!("[{}].contains({})", els.join(", "), x)
+                        }
                     }
                     _ => {
                         let x = self.borrow(a)?;
@@ -3705,6 +3823,22 @@ impl<'a> FGen<'a> {
                 v(self.may_fail("ValueError", "float_str", s))
             }
             "round" => v(format!("pyrt::round({})", self.val(&a[0])?.code)),
+            "min_or" | "max_or" => {
+                let code = self.iter_values(&a[0])?;
+                let d = self.owned(&a[1])?;
+                v(format!("pyrt::{}({}, {})", name, bare(code), d))
+            }
+            "bin" | "hex" | "oct" => v(format!("pyrt::{}({})", name, self.val(&a[0])?.code)),
+            "int_base" => {
+                let s = self.borrow_str(&a[0])?;
+                let b = self.val(&a[1])?;
+                v(format!("pyrt::int_str_base({}, {})", s, b.code))
+            }
+            "unpack" => {
+                let ExprKind::Int(n) = a[1].kind else { unreachable!() };
+                let x = self.owned(&a[0])?;
+                v(format!("pyrt::unpack{}({})", n, x))
+            }
             "round_int" => {
                 let x = self.val(&a[0])?;
                 let n = self.val(&a[1])?;
@@ -3991,10 +4125,15 @@ impl<'a> FGen<'a> {
                 let f = m;
                 v(format!("pyrt::{}({})", f, sb))
             }
+            "rsplit_all" => v(format!("pyrt::rsplit_max({}, {}, -1)", sb, arg(self, 1)?)),
             _ => {
-                // one-argument helpers: strip_chars, zfill, center, ljust, rjust
-                let x = arg(self, 1)?;
-                v(format!("pyrt::{}({}, {})", m, sb, x))
+                // helpers taking the string and the arguments: strip_chars, zfill,
+                // center, replace_n, find_from, partition, split_max, ...
+                let mut xs = vec![sb];
+                for i in 1..a.len() {
+                    xs.push(arg(self, i)?);
+                }
+                v(format!("pyrt::{}({})", m, xs.join(", ")))
             }
         })
     }
@@ -4259,7 +4398,7 @@ fn count3(s: &[Stmt], v: VarId, live: &HashMap<u32, HashSet<VarId>>) -> (u32, u3
 /// Expression without variables or calls (safe to evaluate repeatedly).
 fn pure(e: &Expr) -> bool {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Const(_) | ExprKind::Var(_) => true,
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Const(_) | ExprKind::Var(_) | ExprKind::NoneVal => true,
         ExprKind::Bin(_, a, b) => pure(a) && pure(b),
         ExprKind::Unary(_, a) | ExprKind::ToFloat(a) => pure(a),
         ExprKind::List(v) | ExprKind::Tuple(v) => v.iter().all(pure),
