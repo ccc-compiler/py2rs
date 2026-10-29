@@ -167,6 +167,23 @@ pub fn analyze(p: &Program) -> Res<Exc> {
     for fid in 0..n {
         // extern functions are not generated: their call sites convert the Result
         x.fallible[fid] = p.funcs[fid].ext.is_none() && x.may[fid].iter().any(|k| caught(p, k, &x.need[fid]));
+        if p.funcs[fid].is_gen {
+            // a generator runs on its own thread: no @shared (Rc) objects in or out
+            fn shared(p: &Program, t: &Ty) -> bool {
+                match t {
+                    Ty::Class(c) | Ty::Obj(c) => p.classes[*c].shared,
+                    Ty::List(e) | Ty::Set(e) | Ty::Optional(e) | Ty::Deque(e) | Ty::Gen(e) => shared(p, e),
+                    Ty::Dict(k, v, _) => shared(p, k) || shared(p, v),
+                    Ty::Tuple(ts) => ts.iter().any(|t| shared(p, t)),
+                    _ => false,
+                }
+            }
+            let f = &p.funcs[fid];
+            if f.params.iter().any(|q| shared(p, &f.vars[q.var].ty)) || shared(p, &f.ret) {
+                return err(f.line, "a generator cannot take or yield @shared objects (its body runs on its own thread)")
+                    .map_err(|e| e.hint("return a list instead"));
+            }
+        }
         if x.fallible[fid] && p.funcs[fid].is_gen {
             return err(p.funcs[fid].line, format!("an exception raised inside generator `{}` would be caught by its caller", p.funcs[fid].name))
                 .map_err(|e| e.hint("catch it inside the generator"));

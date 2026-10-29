@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "py2rs"
-version = "0.9.0"
+version = "1.0.0"
 dependencies = [
  "pyrt",
  "regex",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "pyrt"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "indexmap",
  "regex",

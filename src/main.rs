@@ -34,6 +34,13 @@ fn main() {
             build(&args[1], out)
         }
         Some("run") if args.len() >= 2 => run(&args[1], &args[2..]),
+        Some("pyo3") if args.len() >= 2 => {
+            let out = match args.iter().position(|a| a == "-o") {
+                Some(i) if i + 1 < args.len() => Some(PathBuf::from(&args[i + 1])),
+                _ => None,
+            };
+            pyo3_module(&args[1], out)
+        }
         Some("test") => test(&args[1..]),
         Some("fuzz") => fuzz(
             args.get(1).and_then(|n| n.parse().ok()).unwrap_or(200),
@@ -150,8 +157,68 @@ fn check(file: &str) -> i32 {
     }
 }
 
+/// Build cache: `target/` of a checkout, else (an installed py2rs) the temp directory.
 fn cache_target() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("py2rs-cache")
+    if let Ok(d) = std::env::var("PY2RS_CACHE") {
+        return PathBuf::from(d);
+    }
+    if project::pyrt_dir().join("Cargo.toml").exists() {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("py2rs-cache")
+    } else {
+        std::env::temp_dir().join("py2rs-cache")
+    }
+}
+
+/// `py2rs pyo3 FILE.py [-o DIR]`: an extension module `DIR/<name>.so`.
+fn pyo3_module(file: &str, out: Option<PathBuf>) -> i32 {
+    let path = Path::new(file);
+    let (name, toml, lib, skipped) = match py2rs::pyo3::crate_files(path) {
+        Ok(x) => x,
+        Err((f, text, e)) => {
+            eprint!("{}", e.render(&f.display().to_string(), &text));
+            return 1;
+        }
+    };
+    for (f, why) in &skipped {
+        eprintln!("note: `{}` is not exported: {}", f, why);
+    }
+    let dir = out.unwrap_or_else(|| path.with_file_name(format!("{}_pyo3", name)));
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(dir.join("Cargo.toml"), &toml)?;
+        std::fs::write(dir.join("src/lib.rs"), &lib)?;
+        // Python's symbols come from the interpreter that loads the module
+        std::fs::create_dir_all(dir.join(".cargo"))?;
+        let flags = "rustflags = [\"-C\", \"link-arg=-undefined\", \"-C\", \"link-arg=dynamic_lookup\"]\n";
+        std::fs::write(
+            dir.join(".cargo/config.toml"),
+            format!("[target.aarch64-apple-darwin]\n{0}\n[target.x86_64-apple-darwin]\n{0}", flags),
+        )
+    };
+    if let Err(e) = write() {
+        eprintln!("{}: {}", dir.display(), e);
+        return 1;
+    }
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let target = dir.join("target");
+    let r = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&dir)
+        .env("CARGO_TARGET_DIR", &target)
+        .env("PYO3_PYTHON", project::python())
+        .status();
+    if !r.map(|s| s.success()).unwrap_or(false) {
+        return 1;
+    }
+    let ext = if cfg!(target_os = "macos") { "dylib" } else if cfg!(windows) { "dll" } else { "so" };
+    let built = target.join("release").join(format!("{}{}.{}", if cfg!(windows) { "" } else { "lib" }, name, ext));
+    let so = dir.join(format!("{}.{}", name, if cfg!(windows) { "pyd" } else { "so" }));
+    if let Err(e) = std::fs::copy(&built, &so) {
+        eprintln!("{}: {}", built.display(), e);
+        return 1;
+    }
+    println!("{}", so.display());
+    0
 }
 
 fn build(file: &str, out: Option<PathBuf>) -> i32 {

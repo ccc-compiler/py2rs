@@ -13,6 +13,7 @@ pub mod ir;
 pub mod modules;
 pub mod own;
 pub mod project;
+pub mod pyo3;
 pub mod stubgen;
 
 pub use diag::Error;

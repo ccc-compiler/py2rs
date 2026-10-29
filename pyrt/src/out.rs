@@ -7,7 +7,19 @@ use std::sync::Mutex;
 
 static OUT: Mutex<Option<std::io::BufWriter<std::io::Stdout>>> = Mutex::new(None);
 
+/// Where output goes instead (an extension module writes to Python's `sys.stdout`).
+type Sink = Box<dyn Fn(&str) + Send>;
+static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+pub fn set_sink(f: impl Fn(&str) + Send + 'static) {
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+}
+
 pub fn write_out(args: std::fmt::Arguments) {
+    if let Some(f) = SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        f(&args.to_string());
+        return;
+    }
     let mut g = OUT.lock().unwrap_or_else(|e| e.into_inner());
     let w = g.get_or_insert_with(|| std::io::BufWriter::with_capacity(1 << 16, std::io::stdout()));
     if w.write_fmt(args).is_err() {

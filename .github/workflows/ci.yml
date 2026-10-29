@@ -19,3 +19,5 @@ jobs:
         run: PY2RS_PYTHON=python ./target/release/py2rs test
       - name: random programs
         run: PY2RS_PYTHON=python ./target/release/py2rs fuzz 200 1
+      - name: Python extension module (PyO3)
+        run: PY2RS_PYTHON=python tests/pyo3/run.sh

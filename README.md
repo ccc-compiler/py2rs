@@ -1,5 +1,7 @@
 # py2rs
 
+English · [繁體中文](README.tw.md) · [简体中文](README.cn.md)
+
 A translator from a typed subset of Python to readable Rust.
 
 ```python
@@ -29,22 +31,73 @@ fn total(items: &[Item], tax: f64) -> f64 {
 1. **Every value has a static type.** Functions are annotated; locals are inferred.
 2. **No observable sharing.** Python shares mutable objects between names; Rust copies,
    moves or borrows them. py2rs accepts a program only when the difference cannot be
-   seen, and infers `&T` / `&mut T` / `T` for every parameter.
+   seen, and infers `&T` / `&mut T` / `T` for every parameter. (`@shared` classes keep
+   Python's sharing, as `Rc<RefCell<..>>`.)
 3. **Same output as CPython, or a clear error.** Anything that cannot be guaranteed is
    rejected at translation time with the line and a hint, never translated differently.
+4. **Rust crates can be used directly** (`from rust.regex import Regex`).
 
-## Usage
+## Install and use
 
 ```sh
-cargo build --release
-./target/release/py2rs emit  prog.py          # print the Rust program
-./target/release/py2rs check prog.py          # types + ownership only
-./target/release/py2rs explain prog.py        # parameter modes, references, copies
-./target/release/py2rs build prog.py [-o DIR] # Cargo project, release build
-./target/release/py2rs run   prog.py          # build (cached) and run
-./target/release/py2rs test                   # differential test, see below
-./target/release/py2rs fuzz 300               # random programs against CPython
+cargo install py2rs            # or: cargo build --release in a checkout
+py2rs emit  prog.py            # print the Rust program
+py2rs check prog.py            # types + ownership only
+py2rs explain prog.py          # parameter modes, references, copies, Result functions
+py2rs build prog.py [-o DIR]   # Cargo project, release build
+py2rs run   prog.py            # build (cached) and run
+py2rs pyo3  mod.py [-o DIR]    # a Python extension module (PyO3): DIR/mod.so
+py2rs test                     # differential test against CPython (a checkout)
+py2rs fuzz 300                 # random programs against CPython
 ```
+
+A program may import its own modules (`import geometry`, `from geometry import Point`
+with `geometry.py` next to it).
+
+## What is supported
+
+The full definition is [SPEC.md](SPEC.md). In short: `int` (64-bit, overflow is an
+error), `float`, `bool`, `str`, `list`, `dict`, `set`, `tuple`, `Optional`; functions
+with defaults, keywords and `*args`; dataclasses and classes with methods, properties,
+class methods, operator methods and single inheritance; exceptions (also with fields)
+and `try` / `finally`; comprehensions, f-strings, `match`, `with open`, generators,
+nested functions with `nonlocal`, lambdas and `Callable`; generic functions, `Protocol`
+and union parameters (compiled per argument type); `math`, `collections`, `heapq`,
+`bisect`, `itertools`, `functools`, `random` (same numbers as CPython for the same
+seed), `re`, `sys`, `time`, `json.dumps`, `os.path`.
+
+How some constructs come out (more in [docs/cases](docs/cases/README.md)):
+
+| Python | Rust |
+|---|---|
+| `x: T \| None`, `if x is not None:` | `Option<T>`, `if let Some(x) = &x` |
+| `node.next = self.head; self.head = node` | `node.next = self.head.take();` |
+| a local that only reads (`cur = cur.next`) | a reference: `let mut cur = &self.head;` |
+| `item = self.items[k]; item.qty -= 1` | `let item = &mut self.items[k];` |
+| a class with subclasses | an `enum` over the created classes, methods dispatch with `match` |
+| a `raise` that a caller catches | `Result<T, PyErr>` on that path only, `?` |
+| a nested function using `seen` and `nonlocal count` | `fn dfs(.., seen: &mut HashSet<..>, count: &mut i64)`, the variables passed at each call |
+| `def first[T](xs: list[T]) -> T` | `first_int(xs: &[i64])`, `first_str(xs: &[String])`, one per argument type |
+| `def gen(n) -> Iterator[int]: ... yield i` | `pyrt::Gen<i64>`: the body runs strictly in turn with its consumer |
+| `@shared class Node` | `struct Node(Rc<RefCell<NodeData>>)` with getters and setters |
+
+Known differences from CPython: `int` is 64-bit (results beyond it raise
+`OverflowError`); set iteration order is insertion order ([TODO.md](TODO.md)).
+
+## Speed
+
+`python3 bench/run.py`, CPython 3.14 against the translated program (Apple silicon):
+
+| program | CPython | Rust | |
+|---|---:|---:|---:|
+| nbody (float objects) | 1.21 s | 0.012 s | 101x |
+| matmul (lists of floats) | 0.47 s | 0.013 s | 38x |
+| fib (recursion) | 0.26 s | 0.013 s | 20x |
+| sieve | 0.48 s | 0.027 s | 18x |
+| graph (BFS with deque) | 0.14 s | 0.017 s | 8x |
+| objects (dataclasses, sort, dict) | 0.59 s | 0.10 s | 6x |
+| printing | 0.21 s | 0.056 s | 4x |
+| strings, wordfreq | | | 2x |
 
 ## Ownership annotations
 
@@ -73,26 +126,18 @@ date = Regex.new(r"(\d{4})-(\d{2})-(\d{2})")      # Result → ValueError when i
 print(date.replace_all("on 2024-05-17", "$3/$2/$1"))
 ```
 
-```rust
-// py2rs-crate: regex = "1"
-use regex::Regex;
-let date = pyrt::rust_ok(Regex::new("(\\d{4})-(\\d{2})-(\\d{2})"));
-println!("{}", date.replace_all("on 2024-05-17", "$3/$2/$1").into_owned());
-```
+A stub is a Python file of typed declarations; each maps to a Rust path or an expression
+template (`@rust("{self}.find({0}).map(|m| m.as_str().to_string())")`). `py2rs stub
+CRATE[@VERSION]` writes one from the crate's rustdoc JSON. `from rust import inline` is
+the escape hatch: `inline("xs.sort_unstable();")`, `inline[int]("n.count_ones() as i64")`.
 
-A stub is a Python file of typed declarations. Each one maps to a Rust path or to an
-expression template (`@rust("{self}.find({0}).map(|m| m.as_str().to_string())")`); `str`
-parameters are passed as `&str`, `usize` / `u32` / `f32` mark Rust number types, `Result[T]`
-turns `Err` into ValueError (a `try` can catch it), `@mut` marks `&mut self`.
+## Python extension modules
 
-`py2rs stub CRATE[@VERSION]` writes `stubs/CRATE.pyi` from the crate's rustdoc JSON
-(functions and inherent methods whose types fit; the rest is listed as skipped). To run
-the same program under CPython, a stand-in module can sit next to the stub
-(`python/rust/regex.py` implements the regex stub with `re`).
-
-`from rust import inline` is the escape hatch: `inline("xs.sort_unstable();")` is a Rust
-statement, `inline[int]("n.count_ones() as i64")` a Rust expression (both do nothing
-under CPython); the variables they name count as used and modified.
+`py2rs pyo3 mod.py` builds `mod.so`, which Python imports like the original module. Its
+module-level functions are exported (int, float, bool, str, list, tuple, dict and
+`None` arguments and results); an exception they raise is raised in Python with the same
+class; `print` writes to Python's `sys.stdout`. `tests/pyo3/run.sh` checks that importing
+the module prints what importing the Python file prints.
 
 ## Testing
 
@@ -100,100 +145,16 @@ under CPython); the variables they name count as used and modified.
 in one Cargo package and compares stdout, exit code and exception type with CPython
 (`PY2RS_PYTHON`, else python3.14 / 3.13 / 3.12). Input comes from `NAME.in` if present.
 A program whose first line is `# error: TEXT` must be rejected with a message containing
-TEXT (`tests/err/`). The corpus has about 200 programs (algorithms, data processing, object
-oriented code, text and numbers, regressions).
-
-`py2rs fuzz N [SEED]` generates N random well-typed programs (integer division and modulo
-signs, float printing, format specs, slicing, list / dict operations, caught exceptions),
-runs them on CPython and as Rust, and keeps the ones that differ in
-`target/py2rs-cache/fuzz-fail/`.
-
-## The subset
-
-Supported: `int` (i64, overflow is reported), `float`, `bool`, `str`, `list`, `dict`
-(insertion ordered, `IndexMap`), `set`, `tuple`, `T | None` / `Optional[T]`; functions
-with defaults and keyword arguments; `@dataclass` (incl. `frozen=True`) and plain classes
-with `__init__`, methods, `@staticmethod`, `__str__` / `__repr__`; single inheritance
-with overriding, `super()`, `isinstance`; if / while / for (with `else`), comprehensions,
-generator expressions in `sum/min/max/any/all/sorted/list/set/join`, `lambda` as `key=`,
-f-strings with format specs, `try` / `except` / `else` / `finally`, `raise`, exception
-classes, `assert`, `del`, most `str` / `list` / `dict` / `set` methods; operator methods
-(`__add__` ... `__eq__`, `__lt__`, `__len__`, `__getitem__`, `__setitem__`, `__contains__`,
-`__bool__`, `__neg__`, `__abs__`), `@property`, `@classmethod`, constant class attributes;
-nested functions (also recursive, with `nonlocal`); `Callable[[A], R]` parameters with
-lambdas or functions as arguments; `match` (literal, capture, `|`, guard, sequence with
-`*rest`, class and `None` patterns); `with open(...) as f` and text files; generators
-(`yield`, `yield from`, `next`); exception classes with fields; `return` / `break` inside
-`try ... finally`; `*args`; generic functions (`def f[T]`, `TypeVar`), `Protocol` and
-`X | Y` parameters (each call is compiled for its argument types); programs of several
-files (`import m` / `from m import x` with `m.py` next to the program); `@shared` classes
-(`from rust import shared`) whose objects may be shared like in Python.
-
-Standard library (`import M` or `from M import x`):
-
-| module | supported |
-|---|---|
-| `math` | constants and functions |
-| `collections` | `defaultdict` (int / float / str / bool / list / set / dict factories), `Counter` (`most_common`, `total`, `elements`, `update`), `deque` |
-| `heapq` | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nlargest`, `nsmallest` (CPython's heap layout) |
-| `bisect` | `bisect_left`, `bisect_right` / `bisect`, `insort_left`, `insort_right` / `insort` |
-| `itertools` | `permutations`, `combinations`, `product` (incl. `repeat=`), `chain`, `accumulate`, `pairwise` (tuple lengths are literals) |
-| `functools` | `reduce` with a lambda, `@cache` / `@lru_cache(maxsize=None)` |
-| `random` | `seed`, `random`, `randint`, `randrange`, `uniform`, `choice`, `shuffle`, `sample`: CPython's Mersenne Twister, so the same seed gives the same numbers |
-| `re` | `compile`, `search`, `match`, `fullmatch`, `findall`, `finditer`, `sub`, `split`, `escape`, flags `I` / `M` / `S`; `Match.group` / `groups` / `start` / `end` / `span`. Patterns are literals, checked when translating, and run on the `regex` crate |
-| `sys` | `argv`, `exit`, `stdin` (`readline`, `read`, `readlines`, iteration), `stdout.write`, `maxsize`, `setrecursionlimit` (the program runs on a 1 GB stack) |
-| `time` | `time`, `perf_counter`, `monotonic`, `sleep` |
-| `json` | `dumps` |
-| `os` | `path.exists`, `path.join`, `remove` |
-
-How the Python constructs map to Rust:
-
-| Python | Rust |
-|---|---|
-| `x: T \| None`, `if x is not None:` | `Option<T>`, `if let Some(x) = &x` (also `while let`, let-else, let chains) |
-| `node.next = self.head; self.head = node` | `node.next = self.head.take();` |
-| a local that only reads other objects (`cur = cur.next`) | a reference: `let mut cur = &self.head;` |
-| `item = self.items[k]; item.qty -= 1` | `let item = &mut self.items[k];` |
-| `while cur is not None: ... prev = cur; cur = nxt` | `while let Some(mut node) = cur` (the value moves) |
-| a class with subclasses | an `enum` over the classes that are created; methods dispatch with `match` |
-| `isinstance(s, Circle)` | `if let Shape::Circle(s) = &s` |
-| `super().__init__(...)` | `let (name,) = Shape::init(...)` (the base part of `__init__`) |
-| a `raise` some `try` up the call chain catches | `Result<T, PyErr>` on that path only, `?` |
-| a `raise` nothing catches | `pyrt::raise(..)`: traceback and exit 1, like CPython |
-| `try:` | `'ok: { let e = 'body: { ...; break 'ok; }; match e { .. } }` |
-| a nested function using `seen` and `nonlocal count` | a module-level `fn dfs(.., seen: &mut HashSet<..>, count: &mut i64)`, the variables passed at each call |
-| `f: Callable[[int], int]`, `apply(square, 3)`, `lambda x: x + k` | `f: &impl Fn(i64) -> i64`, `apply(&square, 3)`, `&(\|x: i64\| x + k)` |
-| `match s:` / `case Circle(r=r) if r > 0:` | `if let` chains from `isinstance` and comparisons |
-| `def __add__(self, o)`, `a + b` | `fn op_add(&self, o: &V) -> V`, `a.op_add(&b)`; `__eq__` / `__lt__` give `PartialEq` / `PyOrd` |
-| `def gen(n) -> Iterator[int]: ... yield i` | `fn gen(n: i64) -> pyrt::Gen<i64> { pyrt::Gen::new(move \|y\| { .. y.yield_(i); .. }) }` (the body runs in turn with its consumer) |
-| `def first[T](xs: list[T]) -> T`, `first([1])`, `first(["a"])` | `fn first_int(xs: &[i64]) -> i64`, `fn first_str(xs: &[String]) -> String` |
-| `def f(x: int \| str)` with `isinstance(x, int)` | `f_int` / `f_str`, each with only its branch |
-| `@shared class Node` | `struct Node(Rc<RefCell<NodeData>>)` with `name()` / `name_mut()` / `set_name()`, `a is b` → `a.is(&b)` |
-
-Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
-`eval` / `exec` / `getattr` / `globals`, `global` / `nonlocal`, mutable defaults,
-`list * n` of mutable elements, observable aliasing, modifying a container while
-iterating over it, `x or default` on non-bools, `is` other than with None, overrides that
-change a method's types, multiple inheritance. Not yet supported: return / break inside
-`try ... finally`, exceptions from comprehensions inside a `try`, exception classes with
-generator methods and `send()`, exceptions raised in a generator that its consumer
-catches, unions outside parameters, async, `with` other than `open`, mutable class attributes,
-property setters, Callables stored in containers or fields, nested functions with captured
-variables used as values, mapping patterns, other modules. In `re`:
-lookaround and backreferences (the regex crate has neither), `$` without `re.M`
-(Python's `$` also matches before a final newline; use `\Z` or `fullmatch`), function
-replacements; `Match.group(n)` of a group that did not take part raises (Python gives
-None).
-
-Known differences: set iteration order is insertion order (CPython's is hash order;
-see TODO.md);
-`int` is 64-bit.
+TEXT (`tests/err/`). The corpus has about 240 programs and 45 rejections; `py2rs fuzz`
+adds random programs.
 
 ## Layout
 
-- `src/front.rs`: ruff parser AST → typed IR (`src/ir.rs`), unification for locals
+- `src/front.rs` (+ `src/front/`): ruff parser AST → typed IR (`src/ir.rs`); the
+  standard library, `re`, operator methods, nested functions, `match`, generics
 - `src/own.rs`: ownership inference, liveness, aliasing and iteration checks, views
 - `src/exc.rs`: which exceptions can be caught where, so which functions return `Result`
-- `src/gen.rs`: IR → Rust
-- `pyrt/`: runtime: Python printing (float `repr`, containers), format specs,
-  `//` `%` `**` semantics, `str` methods by character index, errors as CPython prints them
+- `src/gen.rs` (+ `src/gen/`): IR → Rust
+- `src/modules.rs`: programs of several files; `src/pyo3.rs`: extension modules
+- `pyrt/`: runtime: Python printing, format specs, `//` `%` `**` semantics, `str`
+  methods by character, exceptions, the standard library, generators, buffered output

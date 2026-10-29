@@ -125,3 +125,10 @@ Generated projects use edition 2024 (let chains).
   code, `pyrt::flush()` at the end of main); key-once `sort_by_key` (`permute`);
   `d[k] = d.get(k, 0) + x` peephole in `store`; borrowed `split` in for loops. Known
   differences still to fix: TODO.md.
+- v1.0: `src/pyo3.rs` (`py2rs pyo3`; `wrappers` + `crate_files`, `project::cargo_toml_lib`,
+  macOS needs `-undefined dynamic_lookup` in the generated `.cargo/config.toml`,
+  `PYO3_PYTHON`); `own::field_consumable` (let-else narrowing of a field, taken with
+  `.take()` in `gen::let_some`), `own::assigns_owned` / `field_dead_after` (partial moves);
+  the generator/@shared check is in `exc::analyze`. Docs: `SPEC.md`, `docs/cases/make.py`,
+  `README.tw.md` (edit) → `README.cn.md` (OpenCC `tw2sp` + mainland terms). Publishing:
+  `pyrt` first, then `py2rs`, only with the owner's go-ahead.

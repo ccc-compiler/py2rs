@@ -2645,6 +2645,11 @@ impl<'a> FGen<'a> {
             }
             self.kinds.insert(v, Kind::Place);
             let m = if self.o.via[self.fid].contains(&v) { "mut " } else { "" };
+            // out of a field: `self.head.take()` (the field is assigned again before it is read)
+            if !matches!(place.kind, ExprKind::Var(_)) {
+                let pm = self.ex_mut(place)?;
+                return Ok(format!("let Some({}{}) = {}.take()", m, name, par(&pm, ATOM)));
+            }
             return Ok(format!("let Some({}{}) = {}", m, name, p.code));
         } else if ty.is_copy() {
             (self.val_r(p).code, Kind::Place)
@@ -4599,7 +4604,7 @@ impl<'a> FGen<'a> {
 
     fn list_method(&mut self, m: &str, a: &[Expr], e: &Expr) -> Res<R> {
         let recv = if mutating_builtin(&format!("list.{}", m)) { self.ex_mut(&a[0])? } else { self.ex(&a[0])? };
-        let rc = par(&recv, ATOM);
+        let rc = recv_code(&recv);
         let v = |c: String| r(c, Kind::Val, ATOM);
         let et = match &a[0].ty {
             Ty::List(t) => (**t).clone(),
@@ -4683,7 +4688,7 @@ impl<'a> FGen<'a> {
 
     fn dict_method(&mut self, m: &str, a: &[Expr], e: &Expr) -> Res<R> {
         let recv = if mutating_builtin(&format!("dict.{}", m)) { self.ex_mut(&a[0])? } else { self.ex(&a[0])? };
-        let rc = par(&recv, ATOM);
+        let rc = recv_code(&recv);
         let v = |c: String| r(c, Kind::Val, ATOM);
         Ok(match m {
             "get" => {
@@ -4723,7 +4728,7 @@ impl<'a> FGen<'a> {
 
     fn set_method(&mut self, m: &str, a: &[Expr]) -> Res<R> {
         let recv = if mutating_builtin(&format!("set.{}", m)) { self.ex_mut(&a[0])? } else { self.ex(&a[0])? };
-        let rc = par(&recv, ATOM);
+        let rc = recv_code(&recv);
         let v = |c: String| r(c, Kind::Val, ATOM);
         Ok(match m {
             "add" => v(format!("{}.insert({})", rc, self.owned(&a[1])?)),
@@ -4746,7 +4751,7 @@ impl<'a> FGen<'a> {
 
     fn str_method(&mut self, m: &str, a: &[Expr]) -> Res<R> {
         let recv = self.ex(&a[0])?;
-        let rc = par(&recv, ATOM);
+        let rc = recv_code(&recv);
         let sb = self.borrow_r(&recv);
         let v = |c: String| r(c, Kind::Val, ATOM);
         let arg = |g: &mut Self, i: usize| -> Res<String> {
@@ -5245,5 +5250,14 @@ fn same_expr(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Field(o, f), ExprKind::Field(p, g)) => f == g && same_expr(o, p),
         (ExprKind::TupleField(o, i), ExprKind::TupleField(p, j)) => i == j && same_expr(o, p),
         _ => false,
+    }
+}
+
+/// A method receiver: `x.f_mut()` rather than `(&mut *x.f_mut())` (auto-deref does the rest).
+fn recv_code(x: &R) -> String {
+    let c = par(x, ATOM);
+    match c.strip_prefix("(&mut *").and_then(|r| r.strip_suffix(')')) {
+        Some(inner) if inner.ends_with("_mut()") && !inner.contains(' ') => inner.to_string(),
+        _ => c,
     }
 }

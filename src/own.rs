@@ -203,7 +203,7 @@ pub fn analyze(p: &Program) -> Res<Own> {
             }
             if self_escapes && !f.class.is_some_and(|c| p.classes[c].shared) {
                 return err(f.line, "`self` cannot be stored or returned")
-                    .map_err(|e| e.hint("return a copy of the fields you need"));
+                    .map_err(|e| e.hint("return a copy of the fields you need, or make the class @shared (from rust import shared)"));
             }
             for (i, (m, local)) in modes.into_iter().enumerate() {
                 if m != o.params[fid][i] || local != o.owned_local[fid][i] {
@@ -1022,6 +1022,25 @@ impl<'a> Fn<'a> {
             self.owned(x, dest, line);
             return;
         }
+        // `self.head = node.next` with nothing reading node.next (or node as a whole)
+        // later: that field is moved out of the local
+        if let ExprKind::Field(o, fld) = &e.kind {
+            if let ExprKind::Var(w) = o.kind {
+                let local = self.f.vars[w].kind == VarKind::Local
+                    && !self.o.views[self.fid].contains(&w)
+                    && !self.o.mut_views[self.fid].contains(&w)
+                    && matches!(self.f.vars[w].ty, Ty::Class(c) if self.p.classes[c].subs.is_empty() && !self.p.classes[c].shared);
+                let in_loop = self.loops.iter().any(|&(a, b)| a <= self.cur_pos && self.cur_pos <= b);
+                // only `place = local.field`, and the local holds its own object
+                let stored = matches!(self.find_stmt(self.cur_stmt).map(|s| &s.kind),
+                    Some(StmtKind::Assign(Target::Place(_), v)) if v.id == e.id);
+                let owner = self.assigns_owned(w);
+                if local && stored && owner && self.in_closure == 0 && !in_loop && self.field_dead_after(w, fld) {
+                    self.moves.insert(e.id);
+                    return;
+                }
+            }
+        }
         // a whole variable that dies here is moved
         if let ExprKind::Var(v) = &e.kind {
             self.owned_seen.insert(*v);
@@ -1247,6 +1266,12 @@ impl<'a> Fn<'a> {
             }
             // the borrowed part: the first source not taken from w itself
             let Some((_, src)) = srcs.iter().find(|(x, e)| x == w && self.place(e).map(|(r, _)| r != *w).unwrap_or(false)) else { continue };
+            // a value taken out of its Optional is simply moved
+            if let ExprKind::Var(nv) = src.kind {
+                if self.f.vars[nv].kind == VarKind::Narrow && self.consumable(nv) {
+                    continue;
+                }
+            }
             let Some((r, p)) = self.place(src) else { continue };
             if self.conflicts(*w, r, &p, &srcs) {
                 continue;
@@ -1439,6 +1464,9 @@ impl<'a> Fn<'a> {
     /// Only if that local is not read again before it is assigned.
     fn consumable(&self, v: VarId) -> bool {
         let Some((r, p)) = self.origin.get(&v) else { return false };
+        if self.field_consumable(*r, p, v) {
+            return true;
+        }
         if p != &vec![Step::Some] || self.f.vars[*r].kind != VarKind::Local {
             return false;
         }
@@ -1447,6 +1475,123 @@ impl<'a> Fn<'a> {
             Some((sid, None)) => !self.live_out.get(sid).map(|l| l.contains(r)).unwrap_or(true),
             _ => false,
         }
+    }
+
+    /// `if self.head is None: raise` / `node = self.head` / `self.head = node.next`: the
+    /// value can be taken out of the field when, after the let-else, only plain copies
+    /// between locals and fields come before the field is assigned again (nothing in
+    /// between can raise or read the object).
+    fn field_consumable(&self, r: VarId, p: &Path, v: VarId) -> bool {
+        let n = p.len();
+        if n < 2 || p[n - 1] != Step::Some || !p[..n - 1].iter().all(|s| matches!(s, Step::Field(_))) {
+            return false;
+        }
+        if !matches!(self.f.vars[r].kind, VarKind::SelfParam | VarKind::Param) {
+            return false;
+        }
+        let Some((sid, None)) = self.narrow_site.get(&v) else { return false };
+        fn find<'b>(b: &'b [Stmt], sid: u32) -> Option<&'b [Stmt]> {
+            for (i, s) in b.iter().enumerate() {
+                if s.id == sid {
+                    return Some(&b[i + 1..]);
+                }
+                for x in s.blocks() {
+                    if let Some(r) = find(x, sid) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        let Some(rest) = find(&self.f.body, *sid) else { return false };
+        let plain = |e: &Expr| matches!(e.kind, ExprKind::Var(_) | ExprKind::Field(..) | ExprKind::NoneVal);
+        for s in rest {
+            match &s.kind {
+                StmtKind::Assign(Target::Place(pl), val) if plain(val) => {
+                    if let Some((r2, p2)) = self.place(pl) {
+                        if r2 == r && p2[..] == p[..n - 1] {
+                            return true;
+                        }
+                    }
+                }
+                StmtKind::Assign(Target::Var(_), val) if plain(val) => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Is every value assigned to `w` its own object (a new one, or a value taken out
+    /// of an Optional)?
+    fn assigns_owned(&self, w: VarId) -> bool {
+        let mut ok = true;
+        let mut any = false;
+        fn walk(s: &[Stmt], w: VarId, f: &Fn, ok: &mut bool, any: &mut bool) {
+            for x in s {
+                if let StmtKind::Assign(t, v) = &x.kind {
+                    let mut vs = vec![];
+                    t.vars(&mut vs);
+                    if vs.contains(&w) {
+                        *any = true;
+                        let owned = match (&v.kind, t) {
+                            (ExprKind::New(..) | ExprKind::Call(..), Target::Var(_)) => true,
+                            (ExprKind::Var(nv), Target::Var(_)) => f.f.vars[*nv].kind == VarKind::Narrow && f.consumable(*nv),
+                            _ => false,
+                        };
+                        *ok &= owned;
+                    }
+                }
+                for b in x.blocks() {
+                    walk(b, w, f, ok, any);
+                }
+            }
+        }
+        walk(&self.f.body, w, self, &mut ok, &mut any);
+        ok && any
+    }
+
+    /// After the current statement, is `w` only used through fields other than `fld`?
+    fn field_dead_after(&self, w: VarId, fld: &str) -> bool {
+        fn ex(e: &Expr, w: VarId, fld: &str, ok: &mut bool) {
+            match &e.kind {
+                ExprKind::Field(o, g) if matches!(o.kind, ExprKind::Var(x) if x == w) => {
+                    if g == fld {
+                        *ok = false;
+                    }
+                    return;
+                }
+                ExprKind::Var(x) if *x == w => {
+                    *ok = false;
+                    return;
+                }
+                _ => {}
+            }
+            e.children(&mut |c| ex(c, w, fld, ok));
+        }
+        let mut ok = true;
+        let mut walk = |s: &Stmt, f: &Fn| {
+            let (p, _) = f.pos[&s.id];
+            if p > f.cur_pos {
+                stmt_exprs_all(s, &mut |e| ex(e, w, fld, &mut ok));
+                if let StmtKind::Assign(t, _) = &s.kind {
+                    let mut vs = vec![];
+                    target_uses(t, &mut vs);
+                    if vs.contains(&w) {
+                        ok = false;
+                    }
+                }
+            }
+        };
+        fn all(s: &[Stmt], f: &Fn, w: &mut dyn FnMut(&Stmt, &Fn)) {
+            for st in s {
+                w(st, f);
+                for b in st.blocks() {
+                    all(b, f, w);
+                }
+            }
+        }
+        all(&self.f.body, self, &mut walk);
+        ok
     }
 
     /// The value of a narrowed Optional borrows from its place.

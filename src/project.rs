@@ -31,12 +31,17 @@ pub fn cargo_toml_with(name: &str, bins: &[String], crates: &[String]) -> String
     features.sort();
     features.dedup();
     let feat = if features.is_empty() { String::new() } else { format!(", features = [{}]", features.join(", ")) };
+    // next to the sources (a checkout), else the published crate (`cargo install py2rs`)
+    let pyrt = if pyrt_dir().join("Cargo.toml").exists() {
+        format!("pyrt = {{ path = {:?}{} }}", pyrt_dir(), feat)
+    } else {
+        format!("pyrt = {{ version = {:?}{} }}", env!("CARGO_PKG_VERSION"), feat)
+    };
     let mut s = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\npyrt = {{ path = {:?}{} }}\n{}\n\
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{}\n{}\n\
          # Python ints never wrap: overflow is reported instead\n[profile.release]\noverflow-checks = true\n",
         name,
-        pyrt_dir(),
-        feat,
+        pyrt,
         deps
     );
     for b in bins {
@@ -57,6 +62,13 @@ pub fn crate_name(path: &Path) -> String {
 }
 
 /// Write `dir/Cargo.toml` and `dir/src/main.rs`.
+/// `Cargo.toml` of a Python extension module (`py2rs pyo3`).
+pub fn cargo_toml_lib(name: &str, crates: &[String]) -> String {
+    let t = cargo_toml_with(name, &[], crates);
+    let t = t.replacen("[dependencies]\n", "[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\npyo3 = { version = \"0.30\", features = [\"extension-module\", \"indexmap\"] }\n", 1);
+    t
+}
+
 pub fn write_project(dir: &Path, name: &str, rust: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("Cargo.toml"), cargo_toml_with(name, &[], &crates_of(rust)))?;
