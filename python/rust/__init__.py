@@ -44,3 +44,8 @@ class inline:
 
     def __new__(cls, code: str):
         return None
+
+
+def shared(cls):
+    """`@shared`: in Rust the objects are `Rc<RefCell<..>>`; in Python nothing changes."""
+    return cls

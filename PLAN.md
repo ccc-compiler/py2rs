@@ -12,9 +12,29 @@ rejection has a test in `tests/err/`.
 | v0.5 | `from rust.CRATE import X`: Cargo dependencies, rustdoc-JSON stubs, borrow / Result / Option mapping, `inline` | done |
 | v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time | done |
 | v0.7 | `with`, files, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | done |
-| v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | |
+| v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | done |
 | v0.9 | benchmarks vs CPython, ASCII strings, fewer clones, buffered print, optional bigint / fixed-width ints, CPython set order | |
 | v1.0 | crates.io packages (publish needs the owner's go-ahead), docs in three languages, subset spec, case studies, PyO3 module output | |
+
+## v0.8 result
+
+- generators: `pyrt::Gen` runs the body on its own thread strictly in turn with the
+  consumer (rendezvous channels), so output interleaves as in CPython; arguments are owned
+  (stores check later changes); exceptions inside are uncaught (catching them is rejected)
+- exception classes with `__init__` are structs (`super().__init__(m)` sets `msg_`);
+  `PyErr::with_data` carries the object, `e.field` reads it
+- `return` / `break` / `continue` in `try ... finally`: each exit runs the pending finally
+  blocks (`FGen.finals`)
+- `*args: T` is a `list[T]` parameter
+- monomorphization (`front/generic.rs`): type variables, Protocol and union parameters
+  bind from argument types; instances `name_type`; `isinstance` on known types is decided
+  statically and the other branch is not lowered
+- multi-file programs (`src/modules.rs`): imported local modules are appended to the
+  source; errors are reported in their own file
+- `@shared` classes: `Rc<RefCell<CData>>` newtype with getters (copies), `f_mut()`
+  (`RefMut`, arguments hoisted first), setters, `is`
+- code after `return` / `raise` / `break` / `continue` is not emitted; programs with
+  unused definitions get `#![allow(dead_code)]`
 
 ## v0.7 result
 

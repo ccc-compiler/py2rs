@@ -6,11 +6,19 @@
 
 use std::fmt;
 
-/// An exception: its class and base classes (most specific first) and message.
-#[derive(Clone, Debug, PartialEq)]
+/// An exception: its class and base classes (most specific first), message and,
+/// for an exception class with fields, the object.
+#[derive(Clone, Debug)]
 pub struct PyErr {
     pub chain: &'static [&'static str],
     pub msg: String,
+    pub data: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl PartialEq for PyErr {
+    fn eq(&self, o: &PyErr) -> bool {
+        self.chain == o.chain && self.msg == o.msg
+    }
 }
 
 pub const EXCEPTION: &[&str] = &["Exception", "BaseException"];
@@ -36,7 +44,15 @@ pub const STOP_ITERATION: &[&str] = &["StopIteration", "Exception", "BaseExcepti
 
 impl PyErr {
     pub fn new(chain: &'static [&'static str], msg: impl Into<String>) -> PyErr {
-        PyErr { chain, msg: msg.into() }
+        PyErr { chain, msg: msg.into(), data: None }
+    }
+    /// An exception object with fields.
+    pub fn with_data<T: std::any::Any + Send + Sync>(chain: &'static [&'static str], msg: String, data: T) -> PyErr {
+        PyErr { chain, msg, data: Some(std::sync::Arc::new(data)) }
+    }
+    /// The fields of the exception object (`except C as e: e.field`).
+    pub fn data<T: 'static>(&self) -> &T {
+        self.data.as_ref().and_then(|d| d.downcast_ref::<T>()).expect("exception object")
     }
     /// The exception's class name.
     pub fn kind(&self) -> &'static str {

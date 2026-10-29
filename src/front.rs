@@ -11,6 +11,7 @@ use crate::diag::{err, Error, Res};
 use crate::ir::*;
 
 mod dunder;
+mod generic;
 mod matching;
 mod nested;
 mod re;
@@ -31,6 +32,11 @@ pub fn lower(src: &str) -> Res<Program> {
 }
 
 pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
+    lower_modules(src, stub_dirs, &[])
+}
+
+/// `src` with the local modules it imports appended (`modules::combine`).
+pub fn lower_modules(src: &str, stub_dirs: &[std::path::PathBuf], modules: &[String]) -> Res<Program> {
     let parsed = match ruff_python_parser::parse_module(src) {
         Ok(p) => p,
         Err(e) => {
@@ -53,6 +59,14 @@ pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
         loop_keys: HashMap::new(),
         class_attrs: HashMap::new(),
         enclosing: vec![],
+        exc_vars: HashMap::new(),
+        typevars: HashSet::new(),
+        local_modules: HashSet::new(),
+        protocols: HashMap::new(),
+        templates: HashMap::new(),
+        instances: HashMap::new(),
+        pending: vec![],
+        type_env: HashMap::new(),
         local_funcs: vec![],
         tvars: Vec::new(),
         next_id: 0,
@@ -65,6 +79,7 @@ pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
         stub_dirs: stub_dirs.to_vec(),
         in_stub: None,
     };
+    f.local_modules = modules.iter().cloned().collect();
     f.module(&module.body)?;
     f.finish()?;
     Ok(f.p)
@@ -88,6 +103,20 @@ struct Front {
     class_attrs: HashMap<(ClassId, String), usize>,
     /// variable names of the functions being lowered (for nested functions' captures)
     enclosing: Vec<HashSet<String>>,
+    /// `except C as e` where C has fields: e → C
+    exc_vars: HashMap<VarId, ClassId>,
+    /// `T = TypeVar("T")`
+    typevars: HashSet<String>,
+    /// local modules of a multi-file program: `m.x` is `x`
+    local_modules: HashSet<String>,
+    /// `class P(Protocol)`: its method names
+    protocols: HashMap<String, Vec<String>>,
+    /// generic functions (instantiated per call) and their instances by type key
+    templates: HashMap<String, &'static ast::StmtFunctionDef>,
+    instances: HashMap<String, FuncId>,
+    pending: Vec<generic::Pending>,
+    /// type variables (and union parameters, `U:<source>`) of the instance being lowered
+    type_env: HashMap<String, Ty>,
     /// nested functions defined in the functions being lowered: (name, the `funcs` entry it hides)
     local_funcs: Vec<Vec<(String, Option<FuncId>)>>,
     tvars: Vec<Option<Ty>>,
@@ -114,30 +143,6 @@ fn width_of(a: &AExpr) -> Option<String> {
         AExpr::Name(n) if WIDTHS.contains(&n.id.as_str()) => Some(n.id.to_string()),
         _ => None,
     }
-}
-
-/// Does a block contain return / break / continue (not inside nested loops for the latter)?
-fn leaves(body: &[AStmt]) -> bool {
-    use ruff_python_ast::statement_visitor::{walk_stmt, StatementVisitor};
-    struct V(bool, u32);
-    impl<'x> StatementVisitor<'x> for V {
-        fn visit_stmt(&mut self, s: &'x AStmt) {
-            match s {
-                AStmt::Return(_) => self.0 = true,
-                AStmt::Break(_) | AStmt::Continue(_) if self.1 == 0 => self.0 = true,
-                AStmt::For(_) | AStmt::While(_) => {
-                    self.1 += 1;
-                    walk_stmt(self, s);
-                    self.1 -= 1;
-                }
-                AStmt::FunctionDef(_) | AStmt::ClassDef(_) => {}
-                _ => walk_stmt(self, s),
-            }
-        }
-    }
-    let mut v = V(false, 0);
-    v.visit_body(body);
-    v.0
 }
 
 /// `x` or `x.a.b` as (root variable, field names).
@@ -251,6 +256,29 @@ fn assigned_names(body: &[AStmt], out: &mut HashMap<String, usize>) {
             _ => {}
         }
     }
+}
+
+/// Does a function body yield (outside nested functions)?
+fn yields(body: &[AStmt]) -> bool {
+    use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+    struct V(bool);
+    impl<'a> Visitor<'a> for V {
+        fn visit_stmt(&mut self, s: &'a AStmt) {
+            if !matches!(s, AStmt::FunctionDef(_) | AStmt::ClassDef(_)) {
+                walk_stmt(self, s);
+            }
+        }
+        fn visit_expr(&mut self, e: &'a AExpr) {
+            match e {
+                AExpr::Yield(_) | AExpr::YieldFrom(_) => self.0 = true,
+                AExpr::Lambda(_) => {}
+                _ => walk_expr(self, e),
+            }
+        }
+    }
+    let mut v = V(false);
+    body.iter().for_each(|s| v.visit_stmt(s));
+    v.0
 }
 
 fn is_const_expr(e: &AExpr, consts: &HashMap<String, usize>) -> bool {
@@ -402,7 +430,7 @@ impl Front {
                         "rust" => {
                             for a in &i.names {
                                 let n = a.name.id.as_str();
-                                if !["Ref", "Mut", "Own", "inline"].contains(&n) {
+                                if !["Ref", "Mut", "Own", "inline", "shared"].contains(&n) {
                                     return err(self.line(s), format!("`rust.{}` is not available", n));
                                 }
                                 self.imports.insert(n.to_string());
@@ -412,7 +440,18 @@ impl Front {
                     }
                 }
                 AStmt::FunctionDef(d) => fdefs.push(d),
-                AStmt::ClassDef(d) => cdefs.push(d),
+                AStmt::ClassDef(d) => {
+                    if !self.protocol(d)? {
+                        cdefs.push(d)
+                    }
+                }
+                // `T = TypeVar("T")`
+                AStmt::Assign(a)
+                    if matches!(&*a.value, AExpr::Call(c) if matches!(&*c.func, AExpr::Name(n) if n.id.as_str() == "TypeVar")) =>
+                {
+                    let [AExpr::Name(n)] = &a.targets[..] else { return err(self.line(s), "unsupported TypeVar") };
+                    self.typevars.insert(n.id.to_string());
+                }
                 AStmt::If(i) if is_main_guard(&i.test) && i.elif_else_clauses.is_empty() => {
                     main_body.extend(i.body.iter())
                 }
@@ -468,6 +507,7 @@ impl Front {
                 dispatch: vec![],
                 exc: None,
                 ext: None,
+                shared: false,
             });
         }
         for d in &cdefs {
@@ -519,6 +559,11 @@ impl Front {
             if self.funcs.contains_key(d.name.id.as_str()) || self.classes.contains_key(d.name.id.as_str()) {
                 return err(self.line(*d), format!("`{}` is defined twice", d.name.id));
             }
+            if self.is_template(d) {
+                let leaked: &'static ast::StmtFunctionDef = Box::leak(Box::new((*d).clone()));
+                self.templates.insert(d.name.id.to_string(), leaked);
+                continue;
+            }
             let id = self.signature(d, None)?;
             self.funcs.insert(d.name.id.to_string(), id);
         }
@@ -552,7 +597,7 @@ impl Front {
             }
         }
         for d in &fdefs {
-            let fid = self.funcs[d.name.id.as_str()];
+            let Some(&fid) = self.funcs.get(d.name.id.as_str()) else { continue };
             self.body(fid, &d.body)?;
         }
         let main = self.p.main;
@@ -562,6 +607,7 @@ impl Front {
             self.stmt(s, &mut stmts)?;
         }
         self.p.funcs[main].body = stmts;
+        self.lower_instances()?;
         Ok(())
     }
 
@@ -622,6 +668,7 @@ impl Front {
                         dispatch: vec![],
                         exc: None,
                         ext: Some(path),
+                        shared: false,
                     });
                     // all classes of the stub are known while it is read
                     self.classes.insert(name.clone(), cid);
@@ -689,6 +736,8 @@ impl Front {
             property: false,
             cls: None,
             captures: vec![],
+            varargs: None,
+            is_gen: false,
             shadows: vec![],
             dispatch: vec![],
             def_class: None,
@@ -733,7 +782,7 @@ impl Front {
         if d.is_async {
             return err(line, "async functions are not supported");
         }
-        if d.type_params.is_some() {
+        if d.type_params.is_some() && self.type_env.is_empty() {
             return err(line, "generic functions are not supported");
         }
         let mut is_static = false;
@@ -773,13 +822,23 @@ impl Front {
         self.p.funcs[fid].cache = cache;
         self.enter(fid);
         let ps = &d.parameters;
-        if ps.vararg.is_some() || ps.kwarg.is_some() {
-            return err(line, "*args / **kwargs are not supported");
+        if ps.kwarg.is_some() {
+            return err(line, "**kwargs is not supported");
         }
-        let all: Vec<&ast::ParameterWithDefault> =
-            ps.posonlyargs.iter().chain(ps.args.iter()).chain(ps.kwonlyargs.iter()).collect();
+        // `*args: T` is a `list[T]` parameter between the positional and keyword-only ones
+        let star = ps.vararg.as_ref().map(|v| ast::ParameterWithDefault {
+            node_index: Default::default(),
+            range: v.range,
+            parameter: (**v).clone(),
+            default: None,
+        });
+        let mut all: Vec<&ast::ParameterWithDefault> = ps.posonlyargs.iter().chain(ps.args.iter()).collect();
+        let star_at = all.len();
+        all.extend(star.iter());
+        all.extend(ps.kwonlyargs.iter());
         let mut first = true;
-        for p in all {
+        for (pi, p) in all.into_iter().enumerate() {
+            let is_star = star.is_some() && pi == star_at;
             let name = p.parameter.name.id.as_str();
             if first && classmethod {
                 first = false;
@@ -818,6 +877,12 @@ impl Front {
             };
             let width = if self.in_stub.is_some() { width_of(a) } else { None };
             let ty = self.ann(a)?;
+            let ty = if is_star {
+                self.p.funcs[fid].varargs = Some(self.p.funcs[fid].params.len());
+                Ty::list(ty)
+            } else {
+                ty
+            };
             if force.is_some() && ty.is_copy() {
                 return err(self.line(&p.parameter), "Ref / Mut / Own are for lists, dicts, sets, str and objects");
             }
@@ -852,7 +917,19 @@ impl Front {
                 ext.as_mut().unwrap().ret_width = width_of(inner);
                 self.ann(inner)?
             }
-            Some(r) => self.ann(r)?,
+            Some(r) => {
+                let t = self.ann(r)?;
+                if yields(&d.body) {
+                    if !matches!(t, Ty::Gen(_)) {
+                        return err(line, "a generator returns Iterator[T]");
+                    }
+                    if class.is_some() {
+                        return err(line, "generator methods are not supported").map_err(|e| e.hint("use a function taking the object"));
+                    }
+                    self.p.funcs[fid].is_gen = true;
+                }
+                t
+            }
             None => Ty::None,
         };
         if let Some(mut x) = ext {
@@ -894,8 +971,20 @@ impl Front {
             if d.body.iter().all(|s| matches!(s, AStmt::Pass(_)) || is_docstring(s)) {
                 return Ok(());
             }
-            return err(self.line(d), "exception classes can only contain `pass` for now");
+            // an exception with fields: a class whose `super().__init__(m)` sets `msg_`
+            let leaked: &'a ast::StmtClassDef = Box::leak(Box::new(self.exc_class(d)?));
+            return self.class_sig_(leaked, cid, bodies, asts);
         }
+        self.class_sig_(d, cid, bodies, asts)
+    }
+
+    fn class_sig_<'a>(
+        &mut self,
+        d: &'a ast::StmtClassDef,
+        cid: ClassId,
+        bodies: &mut Vec<(FuncId, &'a ast::StmtFunctionDef)>,
+        asts: &mut HashMap<ClassId, Vec<(String, &'a ast::StmtFunctionDef, ClassId)>>,
+    ) -> Res<()> {
         for dec in &d.decorator_list {
             let (name, kws) = match &dec.expression {
                 AExpr::Name(n) => (n.id.as_str(), None),
@@ -905,8 +994,16 @@ impl Front {
                 },
                 _ => ("", None),
             };
+            if name == "shared" && self.imports.contains("shared") {
+                let c = &self.p.classes[cid];
+                if c.base.is_some() || !c.subs.is_empty() {
+                    return err(self.line(dec), "@shared classes cannot be in a class hierarchy");
+                }
+                self.p.classes[cid].shared = true;
+                continue;
+            }
             if name != "dataclass" {
-                return err(self.line(dec), "only @dataclass is supported on classes");
+                return err(self.line(dec), "only @dataclass / @shared are supported on classes");
             }
             self.p.classes[cid].dataclass = true;
             if let Some(a) = kws {
@@ -1193,6 +1290,25 @@ impl Front {
 
     fn ann(&mut self, e: &AExpr) -> Res<Ty> {
         let line = self.line(e);
+        if let Some(n) = self.local_name(e) {
+            return self.ann(&n);
+        }
+        // in an instance of a generic function: its type variables and unions
+        if let AExpr::Name(n) = e {
+            if let Some(t) = self.type_env.get(n.id.as_str()) {
+                return Ok(t.clone());
+            }
+            if self.typevars.contains(n.id.as_str()) || self.protocols.contains_key(n.id.as_str()) {
+                return err(line, format!("`{}` can only be used in the parameters of a function", n.id));
+            }
+        }
+        if generic::is_union_ann(e) {
+            return match self.type_env.get(&format!("U:{}", self.src[e.range()].trim())) {
+                Some(t) => Ok(t.clone()),
+                None => err(line, "union types are only supported as function parameters")
+                    .map_err(|e| e.hint("each call is compiled for the type of its argument")),
+            };
+        }
         match e {
             AExpr::Name(n) => match n.id.as_str() {
                 "int" => Ok(Ty::Int),
@@ -1242,6 +1358,12 @@ impl Front {
                         Ok(Ty::Tuple(args.iter().map(|a| self.ann(a)).collect::<Res<_>>()?))
                     }
                     ("Optional", 1) => self.optional(args[0], line),
+                    ("Iterator" | "Iterable" | "Generator", _) if !args.is_empty() => {
+                        if n.id.as_str() == "Generator" && args[1..].iter().any(|a| !matches!(a, AExpr::NoneLiteral(_))) {
+                            return err(line, "Generator[T, None, None]: send() and return values are not supported");
+                        }
+                        Ok(Ty::Gen(Box::new(self.ann(args[0])?)))
+                    }
                     ("Callable", 2) => {
                         let AExpr::List(ps) = args[0] else {
                             return err(line, "Callable[[A, B], R] needs the parameter types in a list");
@@ -1412,8 +1534,41 @@ impl Front {
                 if matches!(*e.value, AExpr::StringLiteral(_) | AExpr::EllipsisLiteral(_)) {
                     return Ok(());
                 }
-                if !matches!(*e.value, AExpr::Call(_)) {
-                    return err(line, "expression statement has no effect");
+                match &*e.value {
+                    AExpr::Yield(y) => {
+                        let Ty::Gen(t) = self.p.funcs[self.cur].ret.clone() else {
+                            return err(line, "`yield` outside a generator");
+                        };
+                        let Some(v) = &y.value else { return err(line, "`yield` needs a value") };
+                        let x = self.expr(v, Some(&t))?;
+                        let x = self.coerce(x, &t, "yielded value")?;
+                        let ye = self.mk(line, Ty::None, ExprKind::Builtin("yield", vec![x]));
+                        out.push(self.stmt_(line, StmtKind::Expr(ye)));
+                        return Ok(());
+                    }
+                    AExpr::YieldFrom(y) => {
+                        // `for v in it: yield v`
+                        let Ty::Gen(t) = self.p.funcs[self.cur].ret.clone() else {
+                            return err(line, "`yield from` outside a generator");
+                        };
+                        let t = *t;
+                        let (iter, item) = self.iter(&y.value)?;
+                        if !self.unify(&item, &t) {
+                            return err(line, "`yield from` items have the wrong type");
+                        }
+                        let vars = &mut self.p.funcs[self.cur].vars;
+                        vars.push(Var { name: "item".into(), ty: t.clone(), kind: VarKind::Bound });
+                        let v = vars.len() - 1;
+                        self.active.insert(v);
+                        let x = self.mk(line, t, ExprKind::Var(v));
+                        let ye = self.mk(line, Ty::None, ExprKind::Builtin("yield", vec![x]));
+                        let body = vec![self.stmt_(line, StmtKind::Expr(ye))];
+                        self.active.remove(&v);
+                        out.push(self.stmt_(line, StmtKind::For(Target::Var(v), iter, body, vec![])));
+                        return Ok(());
+                    }
+                    AExpr::Call(_) => {}
+                    _ => return err(line, "expression statement has no effect"),
                 }
                 let ex = self.expr(&e.value, None)?;
                 StmtKind::Expr(ex)
@@ -1427,7 +1582,8 @@ impl Front {
                     return err(line, "`return` outside a function");
                 }
                 match &r.value {
-                    None if ret == Ty::None => StmtKind::Return(None),
+                    None if ret == Ty::None || matches!(ret, Ty::Gen(_)) => StmtKind::Return(None),
+                    Some(_) if matches!(ret, Ty::Gen(_)) => return err(line, "a generator cannot return a value"),
                     None if matches!(ret, Ty::Optional(_)) => {
                         let n = self.mk(line, ret.clone(), ExprKind::NoneVal);
                         StmtKind::Return(Some(n))
@@ -1538,6 +1694,25 @@ impl Front {
                         None => err(line, "bare `raise` outside an except clause"),
                     };
                 };
+                // an exception with fields: raised as an object
+                let cname = match &**exc {
+                    AExpr::Name(n) => Some(n.id.as_str()),
+                    AExpr::Call(c) => match &*c.func {
+                        AExpr::Name(n) => Some(n.id.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(&c) = cname.and_then(|n| self.classes.get(n)) {
+                    if self.p.classes[c].exc.is_some() && self.p.classes[c].init.is_some() {
+                        let AExpr::Call(call) = &**exc else {
+                            return err(line, format!("`{}` needs its arguments", cname.unwrap()));
+                        };
+                        let obj = self.construct_(c, &call.arguments, line)?;
+                        out.push(self.stmt_(line, StmtKind::Raise(cname.unwrap().to_string(), Some(obj))));
+                        return Ok(());
+                    }
+                }
                 let (name, arg) = match &**exc {
                     AExpr::Name(n) => (n.id.to_string(), None),
                     AExpr::Call(c) => match &*c.func {
@@ -1551,6 +1726,7 @@ impl Front {
                 if !self.is_exception(&name) {
                     return err(line, format!("unknown exception `{}`", name));
                 }
+
                 // str(e) is str(arg); for KeyError it is repr(arg)
                 let key = crate::exc::chain(&self.p, &name).iter().any(|k| k == "KeyError");
                 let msg = match arg {
@@ -1647,18 +1823,6 @@ impl Front {
                 if t.is_star {
                     return err(line, "`except*` is not supported");
                 }
-                if !t.finalbody.is_empty() {
-                    let mut bad = false;
-                    for b in [&t.body[..], &t.orelse[..]].into_iter().chain(t.handlers.iter().map(|h| {
-                        let ast::ExceptHandler::ExceptHandler(h) = h;
-                        &h.body[..]
-                    })) {
-                        bad |= leaves(b);
-                    }
-                    if bad {
-                        return err(line, "return / break / continue inside try ... finally is not supported yet");
-                    }
-                }
                 let body = self.block(&t.body)?;
                 let mut hs = vec![];
                 for h in &t.handlers {
@@ -1693,6 +1857,14 @@ impl Front {
                     };
                     self.active.insert(v);
                     self.handlers.push(v);
+                    // `except C as e` of an exception with fields: `e.field`
+                    if let [k] = &kinds[..] {
+                        if let Some(&c) = self.classes.get(k.as_str()) {
+                            if self.p.classes[c].init.is_some() {
+                                self.exc_vars.insert(v, c);
+                            }
+                        }
+                    }
                     let b = self.block(&h.body)?;
                     self.handlers.pop();
                     self.active.remove(&v);
@@ -1772,6 +1944,25 @@ impl Front {
         top: bool,
         out: &mut Vec<Stmt>,
     ) -> Res<Option<Stmt>> {
+        // `isinstance(x, int)` with x's type known: only the branch that runs
+        if let Some(v) = self.static_isinstance(test)? {
+            if v {
+                let b = self.block(body)?;
+                out.extend(b);
+                return Ok(None);
+            }
+            return match clauses.split_first() {
+                None => Ok(None),
+                Some((c, rest)) => match &c.test {
+                    Some(t) => self.lower_if(t, &c.body, rest, line, top, out),
+                    None => {
+                        let b = self.block(&c.body)?;
+                        out.extend(b);
+                        Ok(None)
+                    }
+                },
+            };
+        }
         let depth = self.narrow.len();
         if let Some((place, pos, rest, cls)) = self.narrowing(test) {
             if let Some((pe, v)) = self.narrow_var(place, cls)? {
@@ -2321,6 +2512,9 @@ impl Front {
                 return err(line, "generator expressions are only supported as arguments of sum/min/max/any/all/list/set/sorted/join")
             }
             AExpr::Attribute(a) => {
+                if let Some(n) = self.local_name(e) {
+                    return self.expr(&n, want);
+                }
                 if let Some(q) = self.std_name(e) {
                     return self.std_value(&q, line);
                 }
@@ -2339,6 +2533,20 @@ impl Front {
                     }
                 }
                 let obj = self.expr(&a.value, None)?;
+                if let (Ty::Exc, ExprKind::Var(v)) = (self.norm(&obj.ty), &obj.kind) {
+                    if let Some(&c) = self.exc_vars.get(v) {
+                        let name = a.attr.id.as_str();
+                        return match self.p.classes[c].field(name).filter(|_| name != "msg_") {
+                            Some(f) => {
+                                let t = f.ty.clone();
+                                let n = self.mk(line, Ty::Str, K::Str(name.to_string()));
+                                let cn = self.mk(line, Ty::Str, K::Str(self.p.classes[c].name.clone()));
+                                Ok(self.mk(line, t, K::Builtin("exc.field", vec![obj, cn, n])))
+                            }
+                            None => err(line, format!("`{}` has no field `{}`", self.p.classes[c].name, name)),
+                        };
+                    }
+                }
                 match self.norm(&obj.ty) {
                     Ty::Class(c) | Ty::Obj(c) => {
                         let name = a.attr.id.as_str();
@@ -2386,7 +2594,7 @@ impl Front {
             },
             AExpr::Named(_) => return err(line, "`:=` is not supported"),
             AExpr::Starred(_) => return err(line, "`*` unpacking is not supported"),
-            AExpr::Yield(_) | AExpr::YieldFrom(_) => return err(line, "generators (`yield`) are not supported yet"),
+            AExpr::Yield(_) | AExpr::YieldFrom(_) => return err(line, "`yield` is only supported as a statement"),
             AExpr::Await(_) => return err(line, "`await` is not supported"),
             AExpr::BytesLiteral(_) => return err(line, "bytes are not supported yet"),
             AExpr::Slice(_) => return err(line, "unexpected slice"),
@@ -2574,6 +2782,17 @@ impl Front {
             }
         }
         let first = self.expr(&c.operands[0], None)?;
+        // `a is b` for @shared objects: the same object
+        if c.ops.len() == 1 && matches!(c.ops[0], ast::CmpOp::Is | ast::CmpOp::IsNot) {
+            let b = self.expr(&c.operands[1], None)?;
+            let shared = |s: &Self, t: &Ty| matches!(s.norm(t), Ty::Class(k) if s.p.classes[k].shared);
+            if !shared(self, &first.ty) || !shared(self, &b.ty) {
+                return err(line, "`is` compares @shared objects (or a value with None)")
+                    .map_err(|e| e.hint("use =="));
+            }
+            let e = self.mk(line, Ty::Bool, ExprKind::Builtin("is", vec![first, b]));
+            return Ok(if c.ops[0] == ast::CmpOp::IsNot { self.mk(line, Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(e))) } else { e });
+        }
         if c.ops.len() == 1 && (self.is_obj(&first.ty) || matches!(c.ops[0], ast::CmpOp::In | ast::CmpOp::NotIn)) {
             let b = self.expr(&c.operands[1], None)?;
             let op = match c.ops[0] {
@@ -2935,7 +3154,7 @@ impl Front {
             return Ok((Iter::Over(l), Ty::Str));
         }
         let t = match self.norm(&x.ty) {
-            Ty::List(t) | Ty::Set(t) | Ty::Deque(t) => *t,
+            Ty::List(t) | Ty::Set(t) | Ty::Deque(t) | Ty::Gen(t) => *t,
             Ty::Dict(k, _, _) => *k,
             Ty::Str => Ty::Str,
             Ty::Tuple(ts) => {
@@ -3229,6 +3448,9 @@ impl Front {
                 if let Some(&cid) = self.classes.get(name) {
                     return self.construct(cid, args, line);
                 }
+                if self.templates.contains_key(name) {
+                    return self.instantiate(name, args, line);
+                }
                 if let Some(q) = self.std_name(&c.func) {
                     return self.std_call(&q, args, want, line);
                 }
@@ -3264,6 +3486,11 @@ impl Front {
                 let st = self.var(sv).ty.clone();
                 let recv = self.mk(line, st, ExprKind::Var(sv));
                 Ok(self.mk(line, t, ExprKind::Method(Box::new(recv), fid, a)))
+            }
+            AExpr::Attribute(a) if self.local_name(&c.func).is_some() => {
+                let mut c2 = c.clone();
+                c2.func = Box::new(self.local_name(&c.func).unwrap());
+                self.call(&c2, want, line)
             }
             AExpr::Attribute(a) => {
                 let m = a.attr.id.as_str();
@@ -3373,13 +3600,32 @@ impl Front {
                 .collect()
         };
         let fname = self.p.funcs[fid].name.clone();
-        if args.args.len() > params.len() {
+        if args.args.len() > params.len() && self.p.funcs[fid].varargs.is_none() {
             return err(line, format!("{}() takes {} arguments but {} were given", fname, params.len(), args.args.len()));
         }
         let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
+        let star = self.p.funcs[fid].varargs;
         for (i, a) in args.args.iter().enumerate() {
+            if let Some(si) = star {
+                if i >= si {
+                    // extra positional arguments go into the `*args` list
+                    let Ty::List(et) = self.norm(&params[si].1) else { unreachable!() };
+                    let e = self.expr(a, Some(&et))?;
+                    let e = self.coerce(e, &et, &format!("argument `{}`", params[si].0))?;
+                    match &mut slots[si] {
+                        Some(Expr { kind: ExprKind::List(v), .. }) => v.push(e),
+                        _ => slots[si] = Some(self.mk(line, params[si].1.clone(), ExprKind::List(vec![e]))),
+                    }
+                    continue;
+                }
+            }
             let e = self.expr(a, Some(&params[i].1))?;
             slots[i] = Some(self.coerce(e, &params[i].1, &format!("argument `{}`", params[i].0))?);
+        }
+        if let Some(si) = star {
+            if slots[si].is_none() {
+                slots[si] = Some(self.mk(line, params[si].1.clone(), ExprKind::List(vec![])));
+            }
         }
         for k in args.keywords.iter() {
             let n = k.arg.as_ref().unwrap().id.as_str();
@@ -3744,8 +3990,21 @@ impl Front {
                 self.isinstance(x, d, None, line)
             }
             "open" => self.open_call(args, line),
+            "next" => {
+                self.kw(args, &[], line)?;
+                self.nargs(args, 1, 2, "next", line)?;
+                let g = self.expr(&args.args[0], None)?;
+                let Ty::Gen(t) = self.norm(&g.ty) else {
+                    return err(line, "next() needs a generator");
+                };
+                let mut v = vec![g];
+                if args.args.len() == 2 {
+                    v.push(self.arg(args, 1, &t, "default")?);
+                }
+                b(self, "gen.next", *t, v)
+            }
             "type" | "id" | "hash" | "getattr" | "setattr" | "hasattr" | "eval" | "exec"
-            | "globals" | "locals" | "vars" | "iter" | "next" | "map" | "filter" | "super" => {
+            | "globals" | "locals" | "vars" | "iter" | "map" | "filter" | "super" => {
                 err(line, format!("{}() is outside the typed subset", name))
             }
             _ if EXCEPTIONS.contains(&name) => err(line, "exceptions can only be raised"),
@@ -3803,6 +4062,7 @@ impl Front {
             }
             Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.printable(t, line)),
             Ty::None => err(line, "cannot print None"),
+            Ty::Gen(_) => err(line, "printing a generator shows its address; print list(...)"),
             Ty::Exc => Ok(()),
             Ty::Optional(t) => self.printable(&t, line),
             _ => Ok(()),

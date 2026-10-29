@@ -26,6 +26,8 @@ pub enum Ty {
     Func(Vec<Ty>, Box<Ty>),
     /// a text file from `open`
     File,
+    /// a generator object (`Iterator[T]` / `Generator[T, None, None]`)
+    Gen(Box<Ty>),
     Set(Box<Ty>),
     Tuple(Vec<Ty>),
     Class(ClassId),
@@ -96,6 +98,7 @@ impl fmt::Display for TyName<'_> {
             Ty::Pattern(_) => write!(f, "re.Pattern"),
             Ty::Match(_) => write!(f, "re.Match"),
             Ty::File => write!(f, "TextIO"),
+            Ty::Gen(t) => write!(f, "Iterator[{}]", TyName(t, p)),
             Ty::Func(ps, r) => {
                 write!(f, "Callable[[")?;
                 for (i, t) in ps.iter().enumerate() {
@@ -375,6 +378,10 @@ pub struct Func {
     pub cls: Option<String>,
     /// a nested function: the enclosing variables it uses, passed as its last parameters
     pub captures: Vec<String>,
+    /// `*args: T`: the index of its `list[T]` parameter
+    pub varargs: Option<usize>,
+    /// a generator function (its body yields)
+    pub is_gen: bool,
     /// loop variables that reuse the name of a local: (loop var, local)
     pub shadows: Vec<(VarId, VarId)>,
     /// a method of a class with subclasses: the implementation of each class
@@ -423,6 +430,8 @@ pub struct Class {
     pub exc: Option<String>,
     /// a Rust type from a crate stub (`regex::Regex`)
     pub ext: Option<String>,
+    /// `@shared`: objects are `Rc<RefCell<..>>`, so names may share them like in Python
+    pub shared: bool,
 }
 
 impl Class {

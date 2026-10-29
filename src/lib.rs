@@ -10,6 +10,7 @@ pub mod front;
 pub mod fuzz;
 pub mod gen;
 pub mod ir;
+pub mod modules;
 pub mod own;
 pub mod project;
 pub mod stubgen;
@@ -87,4 +88,20 @@ pub fn translate(src: &str) -> Result<String, Error> {
     let own = own::analyze(&prog)?;
     let exc = exc::analyze(&prog)?;
     gen::generate(&prog, &own, &exc)
+}
+
+/// Translate a program file (and the local modules it imports).
+pub fn translate_file(path: &std::path::Path) -> Result<String, modules::FileError> {
+    let c = modules::combine(path)?;
+    let r = (|| {
+        let prog = front::lower_modules(&c.src, &front::default_stub_dirs(), &c.modules)?;
+        let own = own::analyze(&prog)?;
+        let exc = exc::analyze(&prog)?;
+        gen::generate(&prog, &own, &exc)
+    })();
+    r.map_err(|mut e| {
+        let (f, src, line) = c.locate(e.line);
+        e.line = line;
+        (f, src, e)
+    })
 }

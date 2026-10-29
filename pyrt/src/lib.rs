@@ -12,6 +12,8 @@ pub mod math;
 #[cfg(feature = "re")]
 pub mod re;
 pub mod files;
+pub mod generator;
+pub use generator::Gen;
 pub mod spec;
 pub mod stdlib;
 pub mod strs;

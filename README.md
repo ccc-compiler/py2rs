@@ -122,7 +122,12 @@ classes, `assert`, `del`, most `str` / `list` / `dict` / `set` methods; operator
 `__bool__`, `__neg__`, `__abs__`), `@property`, `@classmethod`, constant class attributes;
 nested functions (also recursive, with `nonlocal`); `Callable[[A], R]` parameters with
 lambdas or functions as arguments; `match` (literal, capture, `|`, guard, sequence with
-`*rest`, class and `None` patterns); `with open(...) as f` and text files.
+`*rest`, class and `None` patterns); `with open(...) as f` and text files; generators
+(`yield`, `yield from`, `next`); exception classes with fields; `return` / `break` inside
+`try ... finally`; `*args`; generic functions (`def f[T]`, `TypeVar`), `Protocol` and
+`X | Y` parameters (each call is compiled for its argument types); programs of several
+files (`import m` / `from m import x` with `m.py` next to the program); `@shared` classes
+(`from rust import shared`) whose objects may be shared like in Python.
 
 Standard library (`import M` or `from M import x`):
 
@@ -160,6 +165,10 @@ How the Python constructs map to Rust:
 | `f: Callable[[int], int]`, `apply(square, 3)`, `lambda x: x + k` | `f: &impl Fn(i64) -> i64`, `apply(&square, 3)`, `&(\|x: i64\| x + k)` |
 | `match s:` / `case Circle(r=r) if r > 0:` | `if let` chains from `isinstance` and comparisons |
 | `def __add__(self, o)`, `a + b` | `fn op_add(&self, o: &V) -> V`, `a.op_add(&b)`; `__eq__` / `__lt__` give `PartialEq` / `PyOrd` |
+| `def gen(n) -> Iterator[int]: ... yield i` | `fn gen(n: i64) -> pyrt::Gen<i64> { pyrt::Gen::new(move \|y\| { .. y.yield_(i); .. }) }` (the body runs in turn with its consumer) |
+| `def first[T](xs: list[T]) -> T`, `first([1])`, `first(["a"])` | `fn first_int(xs: &[i64]) -> i64`, `fn first_str(xs: &[String]) -> String` |
+| `def f(x: int \| str)` with `isinstance(x, int)` | `f_int` / `f_str`, each with only its branch |
+| `@shared class Node` | `struct Node(Rc<RefCell<NodeData>>)` with `name()` / `name_mut()` / `set_name()`, `a is b` → `a.is(&b)` |
 
 Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
 `eval` / `exec` / `getattr` / `globals`, `global` / `nonlocal`, mutable defaults,
@@ -167,7 +176,8 @@ Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
 iterating over it, `x or default` on non-bools, `is` other than with None, overrides that
 change a method's types, multiple inheritance. Not yet supported: return / break inside
 `try ... finally`, exceptions from comprehensions inside a `try`, exception classes with
-fields, generators (`yield`), async, `with` other than `open`, mutable class attributes,
+generator methods and `send()`, exceptions raised in a generator that its consumer
+catches, unions outside parameters, async, `with` other than `open`, mutable class attributes,
 property setters, Callables stored in containers or fields, nested functions with captured
 variables used as values, mapping patterns, other modules. In `re`:
 lookaround and backreferences (the regex crate has neither), `$` without `re.M`

@@ -153,6 +153,11 @@ pub fn analyze(p: &Program) -> Res<Own> {
                 let _ = a.collect();
                 let mut modes = vec![];
                 for (i, q) in f.params.iter().enumerate() {
+                    // a generator keeps its arguments (its body runs later, on its own)
+                    if f.is_gen && o.params[fid][i] != Mode::Copy {
+                        modes.push((Mode::Owned, false));
+                        continue;
+                    }
                     // a `nonlocal` variable of a nested function is the caller's, by `&mut`
                     if nonlocal(f, i) {
                         modes.push((Mode::Mut, false));
@@ -172,6 +177,9 @@ pub fn analyze(p: &Program) -> Res<Own> {
                     } else {
                         Mode::Ref
                     };
+                    // a @shared object is changed through its handle
+                    let shared = matches!(f.vars[q.var].ty, Ty::Class(c) if p.classes[c].shared);
+                    let m = if shared && m == Mode::Mut { Mode::Ref } else { m };
                     let m = match q.force {
                         Some(Force::Own) => Mode::Owned,
                         Some(Force::Mut) if m == Mode::Ref => Mode::Mut,
@@ -181,7 +189,8 @@ pub fn analyze(p: &Program) -> Res<Own> {
                 }
                 let self_m = match &f.ext {
                     Some(x) => x.self_mut,
-                    None => f.self_var.map(|sv| a.muts.iter().any(|m| m.root == sv) && !f.is_init).unwrap_or(false),
+                    None => f.self_var.map(|sv| a.muts.iter().any(|m| m.root == sv) && !f.is_init).unwrap_or(false)
+                        && !f.class.is_some_and(|c| p.classes[c].shared),
                 };
                 let esc = f.self_var.map(|sv| a.escaped.contains(&sv)).unwrap_or(false);
                 let mv = a.accepted_mut_views();
@@ -192,7 +201,7 @@ pub fn analyze(p: &Program) -> Res<Own> {
                 o.mut_views[fid] = mv;
                 changed = true;
             }
-            if self_escapes {
+            if self_escapes && !f.class.is_some_and(|c| p.classes[c].shared) {
                 return err(f.line, "`self` cannot be stored or returned")
                     .map_err(|e| e.hint("return a copy of the fields you need"));
             }
@@ -307,10 +316,14 @@ fn class_immutability(p: &Program, o: &mut Own) {
     for (i, c) in p.classes.iter().enumerate() {
         o.immutable[i] = c.frozen || !assigned.contains(&i);
     }
+    let shared: Vec<bool> = p.classes.iter().map(|c| c.shared).collect();
     // field types; a value of a class may be any of its subclasses
     loop {
         let mut changed = false;
         for (i, c) in p.classes.iter().enumerate() {
+            if shared[i] {
+                continue;
+            }
             let subs_mut = p.subtree(i).iter().any(|x| !o.immutable[*x]);
             if o.immutable[i] && (subs_mut || !c.fields.iter().all(|f| immutable_ty(&f.ty, &o.immutable))) {
                 o.immutable[i] = false;
@@ -319,6 +332,12 @@ fn class_immutability(p: &Program, o: &mut Own) {
         }
         if !changed {
             break;
+        }
+    }
+    // a @shared object: a copy of the handle is the same object, as in Python
+    for (i, sh) in shared.iter().enumerate() {
+        if *sh {
+            o.immutable[i] = true;
         }
     }
 }
@@ -336,6 +355,7 @@ pub fn immutable_ty(t: &Ty, classes: &[bool]) -> bool {
         Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::None => true,
         Ty::Tuple(ts) => ts.iter().all(|t| immutable_ty(t, classes)),
         Ty::Class(c) => classes[*c],
+        Ty::Optional(t) => matches!(**t, Ty::Class(_)) && immutable_ty(t, classes),
         _ => false,
     }
 }
@@ -436,8 +456,10 @@ impl<'a> Fn<'a> {
     }
 
     fn results(self) -> (HashSet<u32>, HashSet<VarId>, HashSet<VarId>, HashSet<u32>, HashMap<u32, HashSet<VarId>>) {
-        // variables whose object is modified (or borrowed mutably)
-        let mut muts: HashSet<VarId> = self.muts.iter().map(|m| m.root).collect();
+        // variables whose object is modified (or borrowed mutably); a @shared
+        // object is modified through its handle
+        let shared = |v: &VarId| matches!(self.f.vars[*v].ty, Ty::Class(c) if self.p.classes[c].shared);
+        let mut muts: HashSet<VarId> = self.muts.iter().map(|m| m.root).filter(|v| !shared(v)).collect();
         let mut rebound = HashSet::new();
         for v in self.assigned.keys() {
             match self.f.vars[*v].kind {
@@ -863,6 +885,7 @@ impl<'a> Fn<'a> {
                 self.owned(&args[2], Dest::Escape, e.line);
             }
             "list.extend" | "deque.extend" | "counter.update" => self.store_elements(&args[1], e.line),
+            "yield" => self.owned(&args[0], Dest::Escape, e.line),
             "heapq.heappush" | "heapq.heappushpop" | "heapq.heapreplace" | "bisect.insort_left" | "bisect.insort_right"
             | "deque.append" | "deque.appendleft" => self.owned(&args[1], Dest::Escape, e.line),
             "dict.update" => self.store_elements(&args[1], e.line),
@@ -1384,6 +1407,14 @@ impl<'a> Fn<'a> {
     }
 
     fn iter(&mut self, it: &Iter) {
+        // iterating a generator object advances it
+        if let Iter::Over(x) = it {
+            if matches!(x.ty, Ty::Gen(_)) {
+                if let Some((r, p)) = self.place(x) {
+                    self.mutate(r, p, false, x.line);
+                }
+            }
+        }
         match it {
             Iter::Gen(e) => self.expr(e),
             _ => it.exprs(&mut |x| self.expr(x)),

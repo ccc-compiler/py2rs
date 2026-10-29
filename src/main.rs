@@ -61,10 +61,11 @@ fn translate(file: &str) -> Option<String> {
             return None;
         }
     };
-    match py2rs::translate(&src) {
+    let _ = src;
+    match py2rs::translate_file(std::path::Path::new(file)) {
         Ok(r) => Some(r),
-        Err(e) => {
-            eprint!("{}", e.render(file, &src));
+        Err((f, text, e)) => {
+            eprint!("{}", e.render(&f.display().to_string(), &text));
             None
         }
     }
@@ -234,7 +235,7 @@ fn test(args: &[String]) -> i32 {
     for f in files(args) {
         let src = std::fs::read_to_string(&f).unwrap();
         let expect = src.lines().next().and_then(|l| l.strip_prefix("# error: ")).map(|s| s.trim().to_string());
-        match (py2rs::translate(&src), expect) {
+        match (py2rs::translate_file(&f).map_err(|e| e.2), expect) {
             (Ok(_), Some(want)) => {
                 println!("FAIL {} (accepted, expected error: {})", f.display(), want);
                 fails += 1;

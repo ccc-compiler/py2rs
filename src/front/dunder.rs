@@ -39,6 +39,57 @@ impl Front {
         matches!(self.norm(t), Ty::Class(_) | Ty::Obj(_))
     }
 
+    /// An exception class with `__init__`: `super().__init__(m)` → `self.msg_ = str(m)`.
+    pub(super) fn exc_class(&self, d: &ast::StmtClassDef) -> Res<ast::StmtClassDef> {
+        let line = self.line(d);
+        let cid = self.classes[d.name.id.as_str()];
+        if let Some(b) = self.p.classes[cid].base {
+            if self.classes_with_init(b) {
+                return err(line, "an exception with fields cannot extend another one");
+            }
+        }
+        let mut d2 = d.clone();
+        let key = crate::exc::chain(&self.p, d.name.id.as_str()).iter().any(|k| k == "KeyError");
+        for s in d2.body.iter_mut() {
+            let AStmt::FunctionDef(f) = s else {
+                if matches!(s, AStmt::Pass(_)) || is_docstring(s) {
+                    continue;
+                }
+                return err(self.line(s), "exception classes can contain only __init__");
+            };
+            if f.name.id.as_str() != "__init__" {
+                return err(self.line(&*f), "exception classes can contain only __init__");
+            }
+            let mut found = false;
+            for st in f.body.iter_mut() {
+                let AStmt::Expr(e) = st else { continue };
+                let AExpr::Call(c) = &*e.value else { continue };
+                let AExpr::Attribute(a) = &*c.func else { continue };
+                if a.attr.id.as_str() != "__init__" || !matches!(&*a.value, AExpr::Call(s) if matches!(&*s.func, AExpr::Name(n) if n.id.as_str() == "super")) {
+                    continue;
+                }
+                let l = self.line(&*e);
+                let msg = match &c.arguments.args[..] {
+                    [m] if c.arguments.keywords.is_empty() => self.src_of(m),
+                    _ => return err(l, "call super().__init__(message) with one argument"),
+                };
+                let text = format!("self.msg_ = {}({})", if key { "repr" } else { "str" }, msg);
+                let target = self.parse_at("self.msg_", e.range, l)?;
+                let value = self.parse_at(&text["self.msg_ = ".len()..], e.range, l)?;
+                *st = AStmt::Assign(ast::StmtAssign { node_index: Default::default(), range: e.range, targets: vec![target], value: Box::new(value) });
+                found = true;
+            }
+            if !found {
+                return err(self.line(&*f), "the __init__ of an exception must call super().__init__(message)");
+            }
+        }
+        Ok(d2)
+    }
+
+    fn classes_with_init(&self, c: ClassId) -> bool {
+        self.p.classes[c].init.is_some()
+    }
+
     /// A class attribute of `c` or a base class.
     pub(super) fn class_attr(&self, c: ClassId, name: &str) -> Option<usize> {
         let mut k = Some(c);

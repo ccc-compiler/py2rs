@@ -39,11 +39,11 @@ impl Transformer for Subst<'_> {
 }
 
 impl Front {
-    fn src_of(&self, r: &impl Ranged) -> String {
+    pub(super) fn src_of(&self, r: &impl Ranged) -> String {
         format!("({})", &self.src[r.range()])
     }
 
-    fn parse_at(&self, text: &str, at: TextRange, line: u32) -> Res<AExpr> {
+    pub(super) fn parse_at(&self, text: &str, at: TextRange, line: u32) -> Res<AExpr> {
         let mut e = ruff_python_parser::parse_expression(text)
             .map_err(|_| Error::new(line, format!("internal: match lowering produced `{}`", text)))?
             .into_expr();

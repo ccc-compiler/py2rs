@@ -85,6 +85,7 @@ pub fn rty(t: &Ty, p: &Program) -> String {
         Ty::Pattern(_) => "pyrt::re::Pattern".to_string(),
         Ty::Match(_) => "pyrt::re::Match".to_string(),
         Ty::File => "pyrt::files::File".to_string(),
+        Ty::Gen(t) => format!("pyrt::Gen<{}>", rty(t, p)),
         Ty::Func(ps, ret) => {
             let ps: Vec<String> = ps.iter().map(|t| fn_arg_ty(t, p)).collect();
             let r = if **ret == Ty::None { String::new() } else { format!(" -> {}", rty(ret, p)) };
@@ -424,7 +425,7 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     let inst = instantiated(p);
     let fields = enum_fields(p);
     for (ci, c) in p.classes.iter().enumerate() {
-        if c.exc.is_some() || c.ext.is_some() {
+        if (c.exc.is_some() && c.init.is_none()) || c.ext.is_some() {
             continue;
         }
         out += &gen_class(p, o, x, ci, c, &inst, &fields)?;
@@ -500,7 +501,53 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     if any {
         head += "\n";
     }
+    if !all_reachable(p) {
+        head = format!("// some definitions are not used by this program (a module of definitions)\n#![allow(dead_code)]\n\n{}", head);
+    }
     Ok(head + &out)
+}
+
+/// Is every function called (directly or through others) from the program?
+fn all_reachable(p: &Program) -> bool {
+    let mut seen = vec![false; p.funcs.len()];
+    let mut work = vec![p.main];
+    seen[p.main] = true;
+    // special methods are called by Rust traits (printing, ==, sorting)
+    for c in &p.classes {
+        for (n, f) in &c.methods {
+            if matches!(n.as_str(), "__str__" | "__repr__" | "__eq__" | "__lt__") || c.exc.is_some() {
+                seen[*f] = true;
+                work.push(*f);
+            }
+        }
+    }
+    while let Some(f) = work.pop() {
+        let mut found = vec![];
+        fn ex(p: &Program, e: &Expr, found: &mut Vec<FuncId>) {
+            match &e.kind {
+                ExprKind::Call(f, _) | ExprKind::Method(_, f, _) | ExprKind::SuperInit(f, _) => found.push(*f),
+                ExprKind::New(c, _) => found.extend(p.classes[*c].init),
+                _ => {}
+            }
+            e.children(&mut |c| ex(p, c, found));
+        }
+        fn st(p: &Program, s: &Stmt, found: &mut Vec<FuncId>) {
+            stmt_exprs(s, &mut |e| ex(p, e, found));
+            if let StmtKind::Raise(_, Some(Expr { kind: ExprKind::New(c, _), .. })) = &s.kind {
+                found.extend(p.classes[*c].init);
+            }
+            s.blocks().iter().for_each(|b| b.iter().for_each(|x| st(p, x, found)));
+        }
+        p.funcs[f].body.iter().for_each(|s| st(p, s, &mut found));
+        found.extend(p.funcs[f].dispatch.iter().map(|(_, x)| *x));
+        for g in found {
+            if !seen[g] {
+                seen[g] = true;
+                work.push(g);
+            }
+        }
+    }
+    p.funcs.iter().enumerate().all(|(i, f)| seen[i] || f.ext.is_some() || (f.class.is_some() && !f.dispatch.is_empty()))
 }
 
 /// The constant naming an exception class and its bases.
@@ -618,13 +665,17 @@ fn gen_class(
     } else {
         "Clone, Debug"
     };
-    out += &format!("#[derive({})]\npub struct {} {{\n", derives, sname);
-    for f in &c.fields {
-        let t = rty(&f.ty, p);
-        let t = if boxed_field(p, &f.ty) { format!("Box<{}>", t) } else { t };
-        out += &format!("    pub {}: {},\n", ident(&f.name), t);
+    if c.shared {
+        out += &shared_struct(p, c, &sname);
+    } else {
+        out += &format!("#[derive({})]\npub struct {} {{\n", derives, sname);
+        for f in &c.fields {
+            let t = rty(&f.ty, p);
+            let t = if boxed_field(p, &f.ty) { format!("Box<{}>", t) } else { t };
+            out += &format!("    pub {}: {},\n", ident(&f.name), t);
+        }
+        out += "}\n\n";
     }
-    out += "}\n\n";
     // `==` (also in `in`, `list.index`, ...) and sorting use the class's own methods
     let other = |fid: FuncId| if o.params[fid].first() == Some(&Mode::Owned) { "other.clone()" } else { "other" };
     if let Some(f) = user_eq {
@@ -671,7 +722,11 @@ fn gen_class(
             for (i, f) in c.fields.iter().enumerate() {
                 let sep = if i > 0 { ", " } else { "" };
                 out += &format!("        out.push_str(\"{}{}=\");\n", sep, f.name);
-                out += &format!("        self.{}.fmt_repr(out);\n", ident(&f.name));
+                if c.shared {
+                    out += &format!("        self.{}().fmt_repr(out);\n", ident(&f.name));
+                } else {
+                    out += &format!("        self.{}.fmt_repr(out);\n", ident(&f.name));
+                }
             }
             out += "        out.push(')');\n";
         } else {
@@ -684,6 +739,36 @@ fn gen_class(
         out += "}\n\n";
     }
     Ok(out)
+}
+
+/// A @shared class: `C(Rc<RefCell<CData>>)` with accessors; cloning `C` shares the object.
+fn shared_struct(p: &Program, c: &Class, sname: &str) -> String {
+    let mut out = format!("#[derive(Debug{})]\npub struct {}Data {{\n", if c.dataclass { ", PartialEq" } else { "" }, sname);
+    for f in &c.fields {
+        out += &format!("    pub {}: {},\n", ident(&f.name), rty(&f.ty, p));
+    }
+    out += "}\n\n";
+    out += &format!("/// `@shared`: copies of a `{0}` are the same object, as in Python\n#[derive(Clone, Debug)]\npub struct {0}(pub std::rc::Rc<std::cell::RefCell<{0}Data>>);\n\n", sname);
+    out += &format!("#[allow(dead_code)]\nimpl {} {{\n", sname);
+    for f in &c.fields {
+        let n = ident(&f.name);
+        let t = rty(&f.ty, p);
+        let get = if f.ty.is_copy() { format!("self.0.borrow().{}", n) } else { format!("self.0.borrow().{}.clone()", n) };
+        out += &format!("    pub fn {0}(&self) -> {1} {{\n        {2}\n    }}\n", n, t, get);
+        out += &format!(
+            "    pub fn {0}_mut(&self) -> std::cell::RefMut<'_, {1}> {{\n        std::cell::RefMut::map(self.0.borrow_mut(), |d| &mut d.{0})\n    }}\n",
+            n, t
+        );
+        out += &format!("    pub fn set_{0}(&self, v: {1}) {{\n        self.0.borrow_mut().{0} = v;\n    }}\n", n, t);
+    }
+    out += "    /// `a is b`\n    pub fn is(&self, other: &Self) -> bool {\n        std::rc::Rc::ptr_eq(&self.0, &other.0)\n    }\n}\n\n";
+    if c.dataclass {
+        out += &format!(
+            "impl PartialEq for {0} {{\n    fn eq(&self, other: &Self) -> bool {{\n        self.is(other) || *self.0.borrow() == *other.0.borrow()\n    }}\n}}\n\n",
+            sname
+        );
+    }
+    out
 }
 
 /// A class with subclasses: an enum over the classes that are constructed.
@@ -859,6 +944,9 @@ struct FGen<'a> {
     loop_labels: Vec<Option<String>>,
     /// enclosing loops: (label, label used, labeled blocks between here and the loop)
     loops: Vec<(String, bool, u32)>,
+    /// `finally` blocks of the enclosing `try`s and the loop depth at each: a return,
+    /// break or continue runs them first
+    finals: Vec<(Vec<Stmt>, usize)>,
     loopn: u32,
     /// fields of `self` held in locals inside __init__
     init_fields: HashMap<String, String>,
@@ -901,6 +989,7 @@ impl<'a> FGen<'a> {
             nonneg: HashSet::new(),
             labels: 0,
             loop_labels: vec![],
+            finals: vec![],
             loops: vec![],
             loopn: 0,
             init_fields: HashMap::new(),
@@ -1043,6 +1132,16 @@ impl<'a> FGen<'a> {
         if f.is_init {
             self.init_prologue(&inner, &mut out)?;
         }
+        if f.is_gen {
+            // the body runs on the generator's own thread (`pyrt::Gen`)
+            out += &format!("{}pyrt::Gen::new(move |y| {{\n", inner);
+            let inner2 = format!("{}    ", inner);
+            for s in &f.body {
+                self.stmt(s, &inner2, &mut out)?;
+            }
+            out += &format!("{}}})\n{}}}\n", inner, ind);
+            return Ok(out);
+        }
         let body = &f.body;
         let n = body.len();
         for (i, s) in body.iter().enumerate() {
@@ -1060,6 +1159,9 @@ impl<'a> FGen<'a> {
                 }
             }
             self.stmt(s, &inner, &mut out)?;
+            if matches!(s.kind, StmtKind::Return(_) | StmtKind::Raise(..)) {
+                break;
+            }
         }
         if f.is_init {
             let c = &self.p.classes[f.class.unwrap()];
@@ -1082,7 +1184,13 @@ impl<'a> FGen<'a> {
                 let t = if ls.len() == 1 { format!("({},)", ls[0]) } else { format!("({})", ls.join(", ")) };
                 out += &format!("{}{}\n", inner, ok(t, self));
             } else {
-                out += &format!("{}{}\n", inner, ok(format!("Self {{ {} }}", fs.join(", ")), self));
+                let c = &self.p.classes[f.class.unwrap()];
+                let v = if c.shared {
+                    format!("Self(std::rc::Rc::new(std::cell::RefCell::new({}Data {{ {} }})))", c.name, fs.join(", "))
+                } else {
+                    format!("Self {{ {} }}", fs.join(", "))
+                };
+                out += &format!("{}{}\n", inner, ok(v, self));
             }
         } else if matches!(f.ret, Ty::Optional(_)) && !always_exits(body) {
             out += &format!("{}{}\n", inner, ok("None".into(), self));
@@ -1495,6 +1603,10 @@ impl<'a> FGen<'a> {
                 self.region = assigned_vars(&s[i + 1..]);
             }
             self.stmt(st, ind, out)?;
+            // what follows a return / raise / break / continue never runs
+            if matches!(st.kind, StmtKind::Return(_) | StmtKind::Raise(..) | StmtKind::Reraise(_) | StmtKind::Break | StmtKind::Continue) {
+                break;
+            }
         }
         Ok(())
     }
@@ -1562,6 +1674,36 @@ impl<'a> FGen<'a> {
                 out.push_str(&format!("{}{};\n", ind, v.code));
             }
             StmtKind::Pass => {}
+            StmtKind::Break | StmtKind::Continue if !self.loops.is_empty() && self.finals.last().is_some_and(|f| f.1 >= self.loops.len()) => {
+                // the finally code of the trys inside this loop, then leave
+                self.run_finals(self.loops.len(), ind, out)?;
+                let saved = std::mem::take(&mut self.finals);
+                let r = self.stmt_inner(s, ind, out);
+                self.finals = saved;
+                r?;
+            }
+            StmtKind::Return(e) if !self.finals.is_empty() => {
+                // the value first, then the finally code, then return it
+                let v = match e {
+                    Some(e) => Some(self.owned(e)?),
+                    None => None,
+                };
+                for p in std::mem::take(&mut self.pre) {
+                    out.push_str(&format!("{}{}\n", ind, p));
+                }
+                if let Some(v) = &v {
+                    out.push_str(&format!("{}let ret = {};\n", ind, v));
+                }
+                self.run_finals(0, ind, out)?;
+                let r = if v.is_some() { "ret" } else { "()" };
+                if self.x.fallible[self.fid] {
+                    out.push_str(&format!("{}return Ok({});\n", ind, r));
+                } else if v.is_some() {
+                    out.push_str(&format!("{}return ret;\n", ind));
+                } else {
+                    out.push_str(&format!("{}return;\n", ind));
+                }
+            }
             StmtKind::Break => match self.loop_labels.last() {
                 Some(Some(l)) => out.push_str(&format!("{}break {};\n", ind, l)),
                 _ => {
@@ -1783,6 +1925,44 @@ impl<'a> FGen<'a> {
     }
 
     fn try_stmt_(&mut self, body: &[Stmt], hs: &[Handler], orelse: &[Stmt], fin: &[Stmt], ind: &str, out: &mut String) -> Res<()> {
+        let fin_on = !fin.is_empty();
+        if fin_on {
+            self.finals.push((fin.to_vec(), self.loops.len()));
+        }
+        let r = self.try_body(body, hs, orelse, fin, ind, out);
+        if fin_on {
+            self.finals.pop();
+        }
+        r
+    }
+
+    /// The finally code of the innermost `try` (outside of it).
+    fn fin_block(&mut self, fin: &[Stmt], ind: &str, out: &mut String) -> Res<()> {
+        let top = if fin.is_empty() { None } else { self.finals.pop() };
+        let r = self.block(fin, ind, out);
+        if let Some(t) = top {
+            self.finals.push(t);
+        }
+        r
+    }
+
+    /// The `finally` code of the enclosing `try`s entered at loop depth `depth` or deeper.
+    fn run_finals(&mut self, depth: usize, ind: &str, out: &mut String) -> Res<()> {
+        let all = self.finals.clone();
+        for (i, (fin, d)) in all.iter().enumerate().rev() {
+            if *d < depth {
+                break;
+            }
+            // the finally code itself runs outside its try
+            let saved = self.finals.split_off(i);
+            let r = self.block(fin, ind, out);
+            self.finals.extend(saved);
+            r?;
+        }
+        Ok(())
+    }
+
+    fn try_body(&mut self, body: &[Stmt], hs: &[Handler], orelse: &[Stmt], fin: &[Stmt], ind: &str, out: &mut String) -> Res<()> {
         let inner = format!("{}    ", ind);
         let inner2 = format!("{}    ", inner);
         self.tries += 1;
@@ -1790,16 +1970,20 @@ impl<'a> FGen<'a> {
         let (lbody, lok) = (format!("'body{}", n), format!("'ok{}", n));
         self.ctx.push((exc::try_catchers(hs, fin), Some(lbody.clone())));
         let mut b = String::new();
-        self.block(body, &inner2, &mut b)?;
+        let r = self.block(body, &inner2, &mut b);
         self.ctx.pop();
+        r?;
         if !b.contains(&format!("{} ", lbody)) && !b.contains(&format!("{})", lbody)) && !b.contains(&format!("{};", lbody)) {
             // nothing in the body can raise what is caught
             for line in b.lines() {
                 out.push_str(line.strip_prefix("        ").unwrap_or(line));
                 out.push('\n');
             }
-            self.block(orelse, ind, out)?;
-            self.block(fin, ind, out)?;
+            // a body that always leaves has run the finally code at each exit
+            if !always_exits(body) {
+                self.block(orelse, ind, out)?;
+                self.fin_block(fin, ind, out)?;
+            }
             return Ok(());
         }
         let has_fin = !fin.is_empty();
@@ -1844,7 +2028,7 @@ impl<'a> FGen<'a> {
             let p = self.propagate("other");
             if has_fin {
                 let mut f = String::new();
-                self.block(fin, &format!("{}    ", inner2), &mut f)?;
+                self.fin_block(fin, &format!("{}    ", inner2), &mut f)?;
                 arms += &format!("{}other => {{\n{}{}    {};\n{}}}\n", inner2, f, inner2, p, inner2);
             } else {
                 arms += &format!("{}other => {},\n", inner2, p);
@@ -1866,16 +2050,18 @@ impl<'a> FGen<'a> {
             // the body never finishes normally: no 'ok block
             let c: String = code.lines().map(|l| format!("{}\n", l.strip_prefix("    ").unwrap_or(l))).collect();
             out.push_str(&c);
-            self.block(fin, ind, out)?;
+            if !hs.iter().all(|h| always_exits(&h.body)) {
+                self.fin_block(fin, ind, out)?;
+            }
             return Ok(());
         }
         if pend {
             out.push_str(&format!("{}let pending = {}: {{\n{}{}}};\n", ind, lok, code, ind));
-            self.block(fin, ind, out)?;
+            self.fin_block(fin, ind, out)?;
             out.push_str(&format!("{}if let Some(e) = pending {{\n{}{};\n{}}}\n", ind, inner, self.propagate("e"), ind));
         } else {
             out.push_str(&format!("{}{}: {{\n{}{}}}\n", ind, lok, code, ind));
-            self.block(fin, ind, out)?;
+            self.fin_block(fin, ind, out)?;
         }
         Ok(())
     }
@@ -2111,6 +2297,11 @@ impl<'a> FGen<'a> {
                         out.push_str(&format!("{}let {} = {};\n", ind, local, val.code));
                         self.init_fields_declared(f);
                     }
+                    return Ok(());
+                }
+                if self.is_shared(&o.ty) {
+                    let obj = self.ex(o)?;
+                    out.push_str(&format!("{}{}.set_{}({});\n", ind, par(&obj, ATOM), f, val.code));
                     return Ok(());
                 }
                 if self.is_enum(&o.ty) {
@@ -2624,7 +2815,9 @@ impl<'a> FGen<'a> {
                             fs.push(format!("{}: {}", n, v));
                         }
                     }
-                    if fs.is_empty() {
+                    if cl.shared {
+                        r(format!("{}(std::rc::Rc::new(std::cell::RefCell::new({}Data {{ {} }})))", sname, sname, fs.join(", ")), Kind::Val, ATOM)
+                    } else if fs.is_empty() {
                         r(format!("{} {{}}", sname), Kind::Val, ATOM)
                     } else {
                         r(format!("{} {{ {} }}", sname, fs.join(", ")), Kind::Val, ATOM)
@@ -2637,7 +2830,8 @@ impl<'a> FGen<'a> {
                 }
                 let ov = self.ex(o)?;
                 if self.is_enum(&o.ty) {
-                    let k = if e.ty.is_copy() { Kind::Val } else { Kind::Ref };
+                    // a @shared object's getter returns a copy (no borrow outlives it)
+                    let k = if e.ty.is_copy() || self.is_shared(&o.ty) { Kind::Val } else { Kind::Ref };
                     return Ok(r(format!("{}.{}()", par(&ov, ATOM), f), k, ATOM));
                 }
                 let mut x = r(format!("{}.{}", par(&ov, ATOM), ident(f)), Kind::Place, ATOM);
@@ -2848,6 +3042,17 @@ impl<'a> FGen<'a> {
 
     /// `raise K(msg)`
     fn raise_code(&mut self, kind: &str, msg: Option<&Expr>) -> Res<String> {
+        // an exception object with fields
+        if let Some(obj @ Expr { ty: Ty::Class(_), .. }) = msg {
+            let o = self.owned(obj)?;
+            if self.catches(&[kind]) {
+                PYERR.with(|c| c.set(true));
+                EXC_USED.with(|c| c.borrow_mut().insert(kind.to_string()));
+                let p = self.propagate(&format!("PyErr::with_data({}, exc.msg_.clone(), exc)", exc_const(kind)));
+                return Ok(format!("{{\n    let exc = {};\n    {}\n}}", o, p));
+            }
+            return Ok(format!("pyrt::raise({}, &{}.msg_)", rust_str(kind), o));
+        }
         let m = match msg {
             Some(m) => self.borrow_str(m)?,
             None => "\"\"".into(),
@@ -2869,8 +3074,13 @@ impl<'a> FGen<'a> {
         }
     }
 
+    /// Fields through accessors (`f()` / `f_mut()`): an enum over subclasses, or a @shared object.
     fn is_enum(&self, t: &Ty) -> bool {
-        matches!(t, Ty::Class(c) if !self.p.classes[*c].subs.is_empty())
+        matches!(t, Ty::Class(c) if !self.p.classes[*c].subs.is_empty() || self.p.classes[*c].shared)
+    }
+
+    fn is_shared(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Class(c) if self.p.classes[*c].shared)
     }
 
     /// An expression about to be modified: a field of a value that may be any
@@ -2878,6 +3088,10 @@ impl<'a> FGen<'a> {
     fn ex_mut(&mut self, e: &Expr) -> Res<R> {
         match &e.kind {
             ExprKind::Field(o, f) if self.init_field(o, f).is_none() => {
+                if self.is_shared(&o.ty) {
+                    let ov = self.ex(o)?;
+                    return Ok(r(format!("&mut *{}.{}_mut()", par(&ov, ATOM), f), Kind::Mut, UNARY));
+                }
                 let ov = self.ex_mut(o)?;
                 if self.is_enum(&o.ty) {
                     return Ok(r(format!("{}.{}_mut()", par(&ov, ATOM), f), Kind::Mut, ATOM));
@@ -3478,6 +3692,12 @@ impl<'a> FGen<'a> {
             Iter::Over(x) if matches!(&x.kind, ExprKind::List(v) if v.is_empty()) => {
                 let v = format!("Vec::<{}>::new()", self.elem_ty(&x.ty));
                 (if for_loop { v } else { format!("{}.into_iter()", v) }, Item::Val)
+            }
+            Iter::Over(x) if matches!(x.ty, Ty::Gen(_)) && !matches!(x.kind, ExprKind::Call(..)) => {
+                // a generator object in a variable: advance it in place
+                let c = self.ex_mut(x)?;
+                let c = if c.kind == Kind::Mut { c.code } else { format!("{}.by_ref()", par(&c, ATOM)) };
+                (c, Item::Val)
             }
             Iter::Over(x) => {
                 let c = self.ex(x)?;
@@ -4124,6 +4344,27 @@ impl<'a> FGen<'a> {
                 }
             }
             n if n.starts_with("math.") => self.math(&n[5..], a)?,
+            "exc.field" => {
+                let x = self.ex(&a[0])?;
+                let (ExprKind::Str(c), ExprKind::Str(f)) = (&a[1].kind, &a[2].kind) else { unreachable!() };
+                r(format!("{}.data::<{}>().{}", par(&x, ATOM), c, ident(f)), Kind::Place, ATOM)
+            }
+            "yield" => v(format!("y.yield_({})", self.owned(&a[0])?)),
+            "is" => {
+                let x = self.ex(&a[0])?;
+                let y = self.borrow(&a[1])?;
+                v(format!("{}.is({})", par(&x, ATOM), y))
+            }
+            "gen.next" => {
+                let g = self.ex_mut(&a[0])?;
+                match a.get(1) {
+                    Some(d) => {
+                        let dv = self.owned(d)?;
+                        v(format!("{}.next().unwrap_or({})", par(&g, ATOM), dv))
+                    }
+                    None => v(format!("pyrt::generator::next({})", self.mut_ref_of(&g))),
+                }
+            }
             "call_fn" => {
                 let f = self.ex(&a[0])?;
                 let mut xs = vec![];

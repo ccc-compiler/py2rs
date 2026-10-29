@@ -110,3 +110,13 @@ Generated projects use edition 2024 (let chains).
   rewrites `match` into Python `if` source (`parse_at` relocates parsed snippets to the
   case's range; guards get bound names substituted). Files: `Ty::File`,
   `pyrt/src/files.rs`, `with` lowers to assignment + body + `file.close`.
+- v0.8: `pyrt/src/generator.rs` (`Gen::new(move |y| ..)`, `Yield::yield_`, rendezvous
+  channels; `gen` is a keyword in edition 2024), `Func.is_gen` (params Owned in own,
+  fallible generators rejected in exc); exception classes with `__init__`
+  (`front/dunder.rs::exc_class` rewrites `super().__init__(m)` to `self.msg_ = str(m)`,
+  `exc_vars`, `Builtin("exc.field")`, `PyErr.data`); `FGen.finals` + `run_finals` /
+  `fin_block` for exits through finally; `Func.varargs`; `front/generic.rs` (templates,
+  `instantiate`, `bind`, `type_env` with `U:<source>` keys for unions, `pending` bodies,
+  `static_isinstance` in `lower_if`, `protocols`); `src/modules.rs` (`combine`,
+  `translate_file`, `local_name` for `m.x`); `Class.shared` (own: immutable / no `&mut`
+  / self may escape; gen: `shared_struct`, accessors through `is_enum`).

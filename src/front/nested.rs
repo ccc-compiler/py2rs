@@ -61,7 +61,7 @@ pub(super) struct Saved {
 }
 
 impl Front {
-    fn save(&mut self) -> Saved {
+    pub(super) fn save(&mut self) -> Saved {
         Saved {
             cur: self.cur,
             scopes: std::mem::take(&mut self.scopes),
@@ -73,7 +73,7 @@ impl Front {
         }
     }
 
-    fn restore(&mut self, s: Saved) {
+    pub(super) fn restore(&mut self, s: Saved) {
         self.cur = s.cur;
         self.scopes = s.scopes;
         self.active = s.active;
@@ -229,5 +229,20 @@ impl Front {
             out.push(self.arg(args, i, p, "argument")?);
         }
         Ok(self.mk(line, r.clone(), ExprKind::Builtin("call_fn", out)))
+    }
+
+    /// `m.x` of a local module m: the name `x`.
+    pub(super) fn local_name(&self, e: &AExpr) -> Option<AExpr> {
+        let AExpr::Attribute(a) = e else { return None };
+        let AExpr::Name(m) = &*a.value else { return None };
+        if !self.local_modules.contains(m.id.as_str()) || self.lookup(m.id.as_str()).is_some() {
+            return None;
+        }
+        Some(AExpr::Name(ast::ExprName {
+            node_index: Default::default(),
+            range: a.range,
+            id: a.attr.id.clone(),
+            ctx: ast::ExprContext::Load,
+        }))
     }
 }

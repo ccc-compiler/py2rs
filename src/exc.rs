@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use crate::diag::{Error, Res};
+use crate::diag::{err, Error, Res};
 use crate::front::EXCEPTIONS;
 use crate::ir::*;
 
@@ -167,6 +167,10 @@ pub fn analyze(p: &Program) -> Res<Exc> {
     for fid in 0..n {
         // extern functions are not generated: their call sites convert the Result
         x.fallible[fid] = p.funcs[fid].ext.is_none() && x.may[fid].iter().any(|k| caught(p, k, &x.need[fid]));
+        if x.fallible[fid] && p.funcs[fid].is_gen {
+            return err(p.funcs[fid].line, format!("an exception raised inside generator `{}` would be caught by its caller", p.funcs[fid].name))
+                .map_err(|e| e.hint("catch it inside the generator"));
+        }
     }
     // a dispatcher and its implementations agree
     loop {

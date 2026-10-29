@@ -1,4 +1,4 @@
-# error: only supported with None
+# error: compares @shared objects
 a = [1]
 b = [1]
 print(a is b)

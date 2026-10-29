@@ -47,7 +47,7 @@ pub fn mutating(n: &str) -> bool {
             | "bisect.insort_left" | "bisect.insort_right" | "random.shuffle" | "deque.append"
             | "deque.appendleft" | "deque.pop" | "deque.popleft" | "deque.extend" | "deque.clear"
             | "counter.update"
-    ) || n.starts_with("file.")
+    ) || n.starts_with("file.") || n == "gen.next"
 }
 
 /// `@functools.cache`: the function is renamed `NAME_uncached` and a wrapper
