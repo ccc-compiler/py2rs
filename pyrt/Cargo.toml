@@ -7,3 +7,8 @@ license = "MIT"
 
 [dependencies]
 indexmap = "2"
+regex = { version = "1", optional = true }
+
+[features]
+# the `re` module
+re = ["dep:regex"]

@@ -7,6 +7,8 @@ use crate::ir::*;
 use crate::exc::{self, Exc};
 use crate::own::{uses, Mode, Own};
 
+mod stdlib;
+
 const KEYWORDS: &[&str] = &[
     "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
     "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "super", "trait",
@@ -72,7 +74,12 @@ pub fn rty(t: &Ty, p: &Program) -> String {
         Ty::None => "()".into(),
         Ty::List(e) => format!("Vec<{}>", rty(e, p)),
         Ty::Set(e) => format!("IndexSet<{}>", rty(e, p)),
-        Ty::Dict(k, v) => format!("IndexMap<{}, {}>", rty(k, p), rty(v, p)),
+        Ty::Dict(k, v, DK::Plain) => format!("IndexMap<{}, {}>", rty(k, p), rty(v, p)),
+        Ty::Dict(k, v, DK::Default) => format!("pyrt::DefaultDict<{}, {}>", rty(k, p), rty(v, p)),
+        Ty::Dict(k, _, DK::Counter) => format!("pyrt::Counter<{}>", rty(k, p)),
+        Ty::Deque(t) => format!("VecDeque<{}>", rty(t, p)),
+        Ty::Pattern(_) => "pyrt::re::Pattern".to_string(),
+        Ty::Match(_) => "pyrt::re::Match".to_string(),
         Ty::Tuple(ts) => {
             let v: Vec<String> = ts.iter().map(|t| rty(t, p)).collect();
             if v.len() == 1 {
@@ -200,8 +207,15 @@ pub fn mutating_builtin(n: &str) -> bool {
         "list.append" | "list.extend" | "list.insert" | "list.pop" | "list.pop_at" | "list.remove" | "list.sort"
             | "list.reverse" | "list.clear" | "list.swap" | "dict.pop" | "dict.pop_default" | "dict.setdefault"
             | "dict.clear" | "dict.update" | "set.add" | "set.remove" | "set.discard" | "set.clear"
-    )
+    ) || stdlib::mutating(n)
 }
+
+/// Prefixes of the standard library builtins (`gen::stdlib`).
+const STD: &[&str] = &[
+    "re.",
+    "collections.", "deque.", "counter.", "heapq.", "bisect.", "itertools.", "functools.", "random.", "sys.", "time.",
+    "json.",
+];
 
 /// A class that contains itself (through Optional fields) needs a Box.
 pub fn recursive(p: &Program, c: ClassId) -> bool {
@@ -347,7 +361,39 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     CLONES.with(|c| c.borrow_mut().clear());
     EXC_USED.with(|c| c.borrow_mut().clear());
     let mut out = String::new();
-    for c in &p.consts {
+    // constants something refers to (others would be dead code)
+    let mut used_consts = HashSet::new();
+    {
+        fn ex(e: &Expr, u: &mut HashSet<usize>) {
+            if let ExprKind::Const(c) = e.kind {
+                u.insert(c);
+            }
+            e.children(&mut |x| ex(x, u));
+        }
+        fn st(s: &Stmt, u: &mut HashSet<usize>) {
+            stmt_exprs(s, &mut |e| ex(e, u));
+            s.blocks().iter().for_each(|b| b.iter().for_each(|x| st(x, u)));
+        }
+        p.funcs.iter().for_each(|f| f.body.iter().for_each(|s| st(s, &mut used_consts)));
+        p.classes.iter().for_each(|c| c.fields.iter().filter_map(|f| f.default.as_ref()).for_each(|e| ex(e, &mut used_consts)));
+        p.funcs.iter().for_each(|f| f.params.iter().filter_map(|q| q.default.as_ref()).for_each(|e| ex(e, &mut used_consts)));
+        // constants used by constants
+        loop {
+            let n = used_consts.len();
+            for (i, c) in p.consts.iter().enumerate() {
+                if used_consts.contains(&i) {
+                    ex(&c.value, &mut used_consts);
+                }
+            }
+            if used_consts.len() == n {
+                break;
+            }
+        }
+    }
+    for (ci, c) in p.consts.iter().enumerate() {
+        if !used_consts.contains(&ci) {
+            continue;
+        }
         let mut g = FGen::new(p, o, x, p.main);
         let v = g.ex(&c.value)?;
         let (t, code) = match c.value.ty {
@@ -375,11 +421,23 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
             continue;
         }
         let mut g = FGen::new(p, o, x, fid);
-        out += &g.func("")?;
+        let code = g.func("")?;
+        if f.cache {
+            out += &stdlib::cache_wrapper(p, o, x, fid, &code)?;
+        } else {
+            out += &code;
+        }
         out += "\n";
     }
     let mut g = FGen::new(p, o, x, p.main);
-    out += &g.func("")?;
+    let main = g.func("")?;
+    if p.funcs.iter().any(|f| f.body.iter().any(|s| stmt_has_builtin(s, "sys.setrecursionlimit"))) {
+        // deep recursion: the program runs on a thread with a large stack
+        out += &main.replacen("fn main() {", "fn run() {", 1);
+        out += "\nfn main() {\n    pyrt::with_stack(run);\n}\n";
+    } else {
+        out += &main;
+    }
     let uses_map = p_uses_collections(p);
     let mut v = vec![];
     if uses_map.0 {
@@ -387,6 +445,9 @@ pub fn generate(p: &Program, o: &Own, x: &Exc) -> Res<String> {
     }
     if uses_map.1 {
         v.push("IndexSet");
+    }
+    if uses_map.2 {
+        v.push("VecDeque");
     }
     if OR_RAISE.with(|c| c.get()) {
         v.push("OrRaise");
@@ -438,11 +499,15 @@ fn exc_const(name: &str) -> String {
     }
 }
 
-fn p_uses_collections(p: &Program) -> (bool, bool) {
-    fn ty(t: &Ty, m: &mut (bool, bool)) {
+fn p_uses_collections(p: &Program) -> (bool, bool, bool) {
+    fn ty(t: &Ty, m: &mut (bool, bool, bool)) {
         match t {
-            Ty::Dict(k, v) => {
-                m.0 = true;
+            Ty::Deque(e) => {
+                m.2 = true;
+                ty(e, m)
+            }
+            Ty::Dict(k, v, d) => {
+                m.0 |= *d == DK::Plain;
                 ty(k, m);
                 ty(v, m)
             }
@@ -455,18 +520,18 @@ fn p_uses_collections(p: &Program) -> (bool, bool) {
             _ => {}
         }
     }
-    fn ex(e: &Expr, m: &mut (bool, bool)) {
+    fn ex(e: &Expr, m: &mut (bool, bool, bool)) {
         ty(&e.ty, m);
         e.children(&mut |c| ex(c, m));
     }
-    fn st(s: &Stmt, m: &mut (bool, bool)) {
+    fn st(s: &Stmt, m: &mut (bool, bool, bool)) {
         let mut f = |e: &Expr| ex(e, m);
         stmt_exprs(s, &mut f);
         for b in sub_blocks(s) {
             b.iter().for_each(|s| st(s, m));
         }
     }
-    let mut m = (false, false);
+    let mut m = (false, false, false);
     for f in &p.funcs {
         f.vars.iter().for_each(|v| ty(&v.ty, &mut m));
         ty(&f.ret, &mut m);
@@ -2062,6 +2127,11 @@ impl<'a> FGen<'a> {
             ExprKind::Field(o, f) if self.init_field(o, f).is_some() => {
                 r(self.init_field(o, f).unwrap(), Kind::Place, ATOM)
             }
+            ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(_, _, DK::Default | DK::Counter)) => {
+                let base = self.ex_mut(b)?;
+                let ko = self.owned(k)?;
+                r(format!("*{}.at({})", par(&base, ATOM), ko), Kind::Place, UNARY)
+            }
             ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(..)) => {
                 let base = self.ex_mut(b)?;
                 let kb = self.borrow(k)?;
@@ -2359,11 +2429,9 @@ impl<'a> FGen<'a> {
         use ExprKind as K;
         Ok(match &e.kind {
             K::Int(v) => {
-                if *v < 0 {
-                    r(v.to_string(), Kind::Val, UNARY)
-                } else {
-                    r(v.to_string(), Kind::Val, ATOM)
-                }
+                // beyond i32 an untyped literal would not compile
+                let s = if i32::try_from(*v).is_err() { format!("{}_i64", v) } else { v.to_string() };
+                r(s, Kind::Val, if *v < 0 { UNARY } else { ATOM })
             }
             K::Float(v) => {
                 let s = float_lit(*v);
@@ -2534,6 +2602,22 @@ impl<'a> FGen<'a> {
             K::TupleField(o, i) => {
                 let ov = self.ex(o)?;
                 r(format!("{}.{}", par(&ov, ATOM), i), Kind::Place, ATOM)
+            }
+            K::Index(b, k) if matches!(b.ty, Ty::Dict(_, _, DK::Default)) && !self.p.present.contains(&e.id) => {
+                // inserts the default
+                let base = self.ex_mut(b)?;
+                let ko = self.owned(k)?;
+                if e.ty.is_copy() {
+                    // a value right away: no borrow held
+                    r(format!("{}.val({})", par(&base, ATOM), ko), Kind::Val, ATOM)
+                } else {
+                    r(format!("{}.at({})", par(&base, ATOM), ko), Kind::Mut, ATOM)
+                }
+            }
+            K::Index(b, k) if matches!(b.ty, Ty::Dict(_, _, DK::Counter)) => {
+                let base = self.ex(b)?;
+                let kb = self.borrow(k)?;
+                r(format!("{}.get_count({})", par(&base, ATOM), kb), Kind::Val, ATOM)
             }
             K::Index(b, k) => {
                 let base = self.ex(b)?;
@@ -2706,7 +2790,7 @@ impl<'a> FGen<'a> {
     fn elem_ty(&self, t: &Ty) -> String {
         match t {
             Ty::List(e) | Ty::Set(e) => self.ty(e),
-            Ty::Dict(k, v) => format!("{}, {}", self.ty(k), self.ty(v)),
+            Ty::Dict(k, v, _) => format!("{}, {}", self.ty(k), self.ty(v)),
             _ => "_".into(),
         }
     }
@@ -2729,6 +2813,11 @@ impl<'a> FGen<'a> {
             ExprKind::TupleField(o, i) => {
                 let ov = self.ex_mut(o)?;
                 Ok(r(format!("{}.{}", par(&ov, ATOM), i), Kind::Place, ATOM))
+            }
+            ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(_, _, DK::Default | DK::Counter)) => {
+                let base = self.ex_mut(b)?;
+                let ko = self.owned(k)?;
+                Ok(r(format!("{}.at({})", par(&base, ATOM), ko), Kind::Mut, ATOM))
             }
             ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(..)) => {
                 let base = self.ex_mut(b)?;
@@ -3013,7 +3102,7 @@ impl<'a> FGen<'a> {
                         let s = self.borrow_str(a)?;
                         format!("{}.contains({})", par(&c, ATOM), s)
                     }
-                    Ty::List(et) => {
+                    Ty::List(et) | Ty::Deque(et) => {
                         if **et == Ty::Str {
                             let x = self.ex(a)?;
                             if x.kind == Kind::Place {
@@ -3961,6 +4050,7 @@ impl<'a> FGen<'a> {
                 }
             }
             n if n.starts_with("math.") => self.math(&n[5..], a)?,
+            n if STD.iter().any(|m| n.starts_with(m)) => self.std_builtin(n, a, e)?,
             n if n.starts_with("list.") => self.list_method(&n[5..], a, e)?,
             n if n.starts_with("dict.") => self.dict_method(&n[5..], a, e)?,
             n if n.starts_with("set.") => self.set_method(&n[4..], a)?,
@@ -3982,6 +4072,8 @@ impl<'a> FGen<'a> {
                 }
                 ExprKind::Method(_, f, _) if g.o.self_mut[*f] => *m = true,
                 ExprKind::Call(f, _) if g.o.params[*f].contains(&Mode::Mut) => *m = true,
+                ExprKind::Builtin(n, _) if mutating_builtin(n) => *m = true,
+                ExprKind::Index(b, _) if matches!(b.ty, Ty::Dict(_, _, DK::Default)) && !g.p.present.contains(&e.id) => *m = true,
                 _ => {}
             }
             e.children(&mut |c| go(g, c, m));
@@ -4288,10 +4380,13 @@ fn snake(name: &str) -> String {
 
 /// `Vec::<T>::new()` → `Vec::new()` where the type is written next to it.
 fn untyped_new(code: &str) -> String {
-    for c in ["Vec", "IndexMap", "IndexSet"] {
+    for c in ["Vec", "IndexMap", "IndexSet", "VecDeque", "pyrt::Counter"] {
         if code.starts_with(&format!("{}::<", c)) && code.ends_with(">::new()") {
             return format!("{}::new()", c);
         }
+    }
+    if code.starts_with("pyrt::DefaultDict::<") && code.contains(">::new(\"") {
+        return format!("pyrt::DefaultDict::new({}", code.rsplit_once("::new(").unwrap().1);
     }
     code.to_string()
 }
@@ -4630,4 +4725,19 @@ fn rust_spec(spec: &str, t: &Ty) -> Option<(String, bool, bool)> {
         }
         _ => None,
     }
+}
+
+/// Does `s` (or a statement inside it) call the builtin `name`?
+fn stmt_has_builtin(s: &Stmt, name: &str) -> bool {
+    fn ex(e: &Expr, name: &str, found: &mut bool) {
+        if let ExprKind::Builtin(n, _) = &e.kind {
+            if *n == name {
+                *found = true;
+            }
+        }
+        e.children(&mut |c| ex(c, name, found));
+    }
+    let mut found = false;
+    stmt_exprs(s, &mut |e| ex(e, name, &mut found));
+    found || s.blocks().iter().any(|b| b.iter().any(|x| stmt_has_builtin(x, name)))
 }

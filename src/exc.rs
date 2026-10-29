@@ -66,7 +66,9 @@ pub fn op_kinds(e: &Expr) -> (Vec<&'static str>, Vec<&'static str>) {
     };
     match &e.kind {
         K::Index(b, _) => match b.ty {
-            Ty::Dict(..) => (vec!["KeyError"], vec![]),
+            Ty::Dict(_, _, DK::Plain) => (vec!["KeyError"], vec![]),
+            Ty::Dict(..) => (vec![], vec![]),
+            Ty::Deque(_) => (vec![], vec!["IndexError"]),
             _ => (vec!["IndexError"], vec![]),
         },
         K::Bin(BinOp::Div | BinOp::FloorDiv | BinOp::Mod, _, d) if !nonzero(d) && e.ty.is_num() => {
@@ -94,7 +96,11 @@ pub fn op_kinds(e: &Expr) -> (Vec<&'static str>, Vec<&'static str>) {
                 (vec![], vec!["ValueError"])
             }
             "input" => (vec![], vec!["EOFError"]),
-            "list.swap" => (vec![], vec!["IndexError"]),
+            "list.swap" | "heapq.heappop" | "heapq.heapreplace" | "deque.pop" | "deque.popleft" | "random.choice" => {
+                (vec![], vec!["IndexError"])
+            }
+            "random.sample" | "random.randrange" | "random.randint" => (vec![], vec!["ValueError"]),
+            "functools.reduce" if a.len() == 2 => (vec![], vec!["TypeError"]),
             _ => (vec![], vec![]),
         },
         _ => (vec![], vec![]),

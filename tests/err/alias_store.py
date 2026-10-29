@@ -1,4 +1,4 @@
-# error: still reachable
+# error: shares with the container
 path = [1]
 result: list[list[int]] = []
 result.append(path)

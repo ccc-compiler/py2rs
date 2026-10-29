@@ -88,3 +88,13 @@ Generated projects use edition 2024 (let chains).
   `stubgen.rs` + `py2rs stub` (rustdoc JSON via `cargo doc` with RUSTDOCFLAGS
   `--output-format json`); CPython stand-ins in `python/rust/` (`regex.py`); `inline`.
 
+- v0.6 stdlib: `front/stdlib.rs` (`MODULES`, `from_names` for `from M import x`,
+  `std_name` resolves `M.x` / `x` to a qualified name, `std_call` / `std_value` /
+  `std_ann` / `std_method`) → `Builtin("module.function")` → `gen/stdlib.rs`
+  (`std_builtin`, `mutating`, `cache_wrapper`) → `pyrt/src/stdlib.rs`. `re`:
+  `front/re.rs` converts and checks patterns with the regex crate (py2rs depends on
+  it), `Ty::Pattern(n)` / `Ty::Match(n)` carry the group count, `pyrt/src/re.rs`
+  behind feature `re` (`Program.crates` entry `pyrt/re` becomes a pyrt feature in
+  Cargo.toml). `own.stores`: a copy stored in a container is checked against later
+  modifications of the source, or of anything reached through a path / deeply while the
+  source is live.

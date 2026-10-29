@@ -10,6 +10,9 @@ use ruff_text_size::Ranged;
 use crate::diag::{err, Error, Res};
 use crate::ir::*;
 
+mod re;
+mod stdlib;
+
 /// Where crate stubs (`regex.pyi` for `from rust.regex import ...`) are looked up.
 pub fn default_stub_dirs() -> Vec<std::path::PathBuf> {
     let mut v = vec![std::path::PathBuf::from("stubs")];
@@ -42,6 +45,8 @@ pub fn lower_with(src: &str, stub_dirs: &[std::path::PathBuf]) -> Res<Program> {
         consts: HashMap::new(),
         module_vars: HashSet::new(),
         imports: HashSet::new(),
+        from_names: HashMap::new(),
+        loop_keys: HashMap::new(),
         tvars: Vec::new(),
         next_id: 0,
         cur: 0,
@@ -66,6 +71,10 @@ struct Front {
     consts: HashMap<String, usize>,
     module_vars: HashSet<String>,
     imports: HashSet<String>,
+    /// `from M import x`: x → `M.x`
+    from_names: HashMap<String, String>,
+    /// loop variable → the dict whose keys it runs over
+    loop_keys: HashMap<VarId, VarId>,
     tvars: Vec<Option<Ty>>,
     next_id: u32,
     cur: FuncId,
@@ -270,7 +279,7 @@ impl Front {
             },
             Ty::List(a) => Ty::list(self.norm(a)),
             Ty::Set(a) => Ty::set(self.norm(a)),
-            Ty::Dict(k, v) => Ty::dict(self.norm(k), self.norm(v)),
+            Ty::Dict(k, v, d) => Ty::Dict(Box::new(self.norm(k)), Box::new(self.norm(v)), *d),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.norm(t)).collect()),
             Ty::Optional(a) => Ty::opt(self.norm(a)),
             _ => t.clone(),
@@ -290,7 +299,7 @@ impl Front {
                 true
             }
             (Ty::List(x), Ty::List(y)) | (Ty::Set(x), Ty::Set(y)) | (Ty::Optional(x), Ty::Optional(y)) => self.unify(x, y),
-            (Ty::Dict(k1, v1), Ty::Dict(k2, v2)) => self.unify(k1, k2) && self.unify(v1, v2),
+            (Ty::Dict(k1, v1, d1), Ty::Dict(k2, v2, d2)) => d1 == d2 && self.unify(k1, k2) && self.unify(v1, v2),
             (Ty::Tuple(x), Ty::Tuple(y)) => {
                 x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| self.unify(p, q))
             }
@@ -343,9 +352,9 @@ impl Front {
                 AStmt::Import(i) => {
                     for a in &i.names {
                         let n = a.name.id.as_str();
-                        if !["math", "dataclasses", "typing", "sys"].contains(&n) || a.asname.is_some() {
+                        if !(stdlib::MODULES.contains(&n) || ["dataclasses", "typing"].contains(&n)) || a.asname.is_some() {
                             return err(self.line(s), format!("module `{}` is not supported", n))
-                                .map_err(|e| e.hint("supported: math, dataclasses, typing"));
+                                .map_err(|e| e.hint(format!("supported: {}, dataclasses, typing", stdlib::MODULES.join(", "))));
                         }
                         self.imports.insert(n.to_string());
                     }
@@ -356,6 +365,12 @@ impl Front {
                         "dataclasses" | "typing" | "__future__" => {
                             for a in &i.names {
                                 self.imports.insert(a.name.id.to_string());
+                            }
+                        }
+                        m if stdlib::MODULES.contains(&m) => {
+                            for a in &i.names {
+                                let local = a.asname.as_ref().unwrap_or(&a.name).id.to_string();
+                                self.from_names.insert(local, format!("{}.{}", m, a.name.id));
                             }
                         }
                         m if m.starts_with("rust.") => {
@@ -402,6 +417,10 @@ impl Front {
                 }
                 _ => main_body.push(s),
             }
+        }
+        // `re` runs on the regex crate: a feature of pyrt
+        if self.imports.contains("re") || self.from_names.values().any(|q| q.starts_with("re.")) {
+            self.p.crates.push("pyrt/re".into());
         }
         for n in counts.keys() {
             if !self.consts.contains_key(n) {
@@ -644,6 +663,7 @@ impl Front {
             vars: vec![],
             is_init: false,
             is_static: false,
+            cache: false,
             shadows: vec![],
             dispatch: vec![],
             def_class: None,
@@ -692,8 +712,13 @@ impl Front {
             return err(line, "generic functions are not supported");
         }
         let mut is_static = false;
+        let mut cache = false;
         let mut ext = self.in_stub.as_ref().map(|_| Extern::default());
         for dec in &d.decorator_list {
+            if let Some(c) = self.cache_decorator(&dec.expression, class.is_some(), self.line(dec))? {
+                cache = c;
+                continue;
+            }
             match &dec.expression {
                 AExpr::Name(n) if n.id.as_str() == "staticmethod" && class.is_some() => is_static = true,
                 // stubs: @rust("path or {self}.template({0})"), @mut
@@ -705,10 +730,11 @@ impl Front {
                     ext.as_mut().unwrap().rust = l.value.to_str().to_string();
                 }
                 _ => return err(self.line(dec), "decorators are not supported here")
-                    .map_err(|e| e.hint("supported: @dataclass on classes, @staticmethod on methods")),
+                    .map_err(|e| e.hint("supported: @dataclass on classes, @staticmethod on methods, @functools.cache on functions")),
             }
         }
         let fid = self.new_func(d.name.id.as_str(), line, class);
+        self.p.funcs[fid].cache = cache;
         self.enter(fid);
         let ps = &d.parameters;
         if ps.vararg.is_some() || ps.kwarg.is_some() {
@@ -801,6 +827,12 @@ impl Front {
             self.p.funcs[fid].ext = Some(x);
         }
         self.p.funcs[fid].is_static = is_static;
+        if cache {
+            for q in self.p.funcs[fid].params.clone() {
+                let t = self.p.funcs[fid].vars[q.var].ty.clone();
+                self.hashable(&t, line).map_err(|e| Error::new(line, format!("@cache: {}", e.msg)))?;
+            }
+        }
         Ok(fid)
     }
 
@@ -1075,11 +1107,14 @@ impl Front {
                 }
             }
             AExpr::Subscript(s) => {
-                let AExpr::Name(n) = &*s.value else { return err(line, "unsupported type annotation") };
                 let args: Vec<&AExpr> = match &*s.slice {
                     AExpr::Tuple(t) => t.elts.iter().collect(),
                     x => vec![x],
                 };
+                if let Some(q) = self.std_name(&s.value) {
+                    return self.std_ann(&q, &args, line);
+                }
+                let AExpr::Name(n) = &*s.value else { return err(line, "unsupported type annotation") };
                 match (n.id.as_str(), args.len()) {
                     ("list" | "List", 1) => Ok(Ty::list(self.ann(args[0])?)),
                     ("set" | "Set", 1) => Ok(Ty::set(self.ann(args[0])?)),
@@ -1171,14 +1206,14 @@ impl Front {
             AExpr::Name(_) | AExpr::Attribute(_) if is_place(test) => {
                 let e = self.expr(test, None).ok()?;
                 match self.norm(&e.ty) {
-                    Ty::Optional(t) if matches!(*t, Ty::Class(_)) => Some((test, true, vec![], None)),
+                    Ty::Optional(t) if matches!(*t, Ty::Class(_) | Ty::Match(_) | Ty::Pattern(_)) => Some((test, true, vec![], None)),
                     _ => None,
                 }
             }
             AExpr::UnaryOp(u) if u.op == ast::UnaryOp::Not && is_place(&u.operand) => {
                 let e = self.expr(&u.operand, None).ok()?;
                 match self.norm(&e.ty) {
-                    Ty::Optional(t) if matches!(*t, Ty::Class(_)) => Some((&u.operand, false, vec![], None)),
+                    Ty::Optional(t) if matches!(*t, Ty::Class(_) | Ty::Match(_) | Ty::Pattern(_)) => Some((&u.operand, false, vec![], None)),
                     _ => None,
                 }
             }
@@ -1324,11 +1359,24 @@ impl Front {
                     .map(|(n, v)| (n.clone(), self.scopes[0].insert(n.clone(), *v)))
                     .collect();
                 self.active.extend(vars.iter().copied());
+                // `for k in d` / `for k, v in d.items()`: k is a key of d
+                let key_of = match (&iter, &target) {
+                    (Iter::Over(d) | Iter::Keys(d), Target::Var(k)) => Some((*k, d)),
+                    (Iter::Items(d), Target::Tuple(ts)) => match ts.first() {
+                        Some(Target::Var(k)) => Some((*k, d)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((k, Expr { kind: ExprKind::Var(d), ty: Ty::Dict(..), .. })) = key_of {
+                    self.loop_keys.insert(k, *d);
+                }
                 self.loops += 1;
                 let body = self.block(&f.body)?;
                 self.loops -= 1;
                 for v in &vars {
                     self.active.remove(v);
+                    self.loop_keys.remove(v);
                 }
                 let orelse = self.block(&f.orelse)?;
                 for (n, old) in saved {
@@ -1759,7 +1807,7 @@ impl Front {
                         let et = (**et).clone();
                         Ok(Target::Place(self.mk(line, et, ExprKind::Index(Box::new(base), Box::new(i)))))
                     }
-                    Ty::Dict(kt, vt) => {
+                    Ty::Dict(kt, vt, _) => {
                         let k = self.expr(&s.slice, Some(kt))?;
                         let k = self.coerce(k, kt, "dict key")?;
                         *val = self.coerce(e, vt, "dict value")?;
@@ -1880,11 +1928,11 @@ impl Front {
         let t = self.norm(&e.ty);
         match t {
             Ty::Bool => Ok(e),
-            Ty::Int | Ty::Float | Ty::Str | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) => {
+            Ty::Int | Ty::Float | Ty::Str | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Deque(_) => {
                 let line = e.line;
                 Ok(self.mk(line, Ty::Bool, ExprKind::Builtin("truth", vec![e])))
             }
-            Ty::Optional(inner) if matches!(*inner, Ty::Class(_)) => {
+            Ty::Optional(inner) if matches!(*inner, Ty::Class(_) | Ty::Match(_) | Ty::Pattern(_)) => {
                 let line = e.line;
                 Ok(self.mk(line, Ty::Bool, ExprKind::IsSome(Box::new(e), true, None)))
             }
@@ -2025,7 +2073,7 @@ impl Front {
             }
             AExpr::Dict(d) => {
                 let (kt, vt) = match want.map(|w| self.norm(w)) {
-                    Some(Ty::Dict(k, v)) => (*k, *v),
+                    Some(Ty::Dict(k, v, _)) => (*k, *v),
                     _ => (self.fresh(), self.fresh()),
                 };
                 let mut v = Vec::new();
@@ -2069,10 +2117,8 @@ impl Front {
                 return err(line, "generator expressions are only supported as arguments of sum/min/max/any/all/list/set/sorted/join")
             }
             AExpr::Attribute(a) => {
-                if let AExpr::Name(n) = &*a.value {
-                    if n.id.as_str() == "math" && self.lookup("math").is_none() {
-                        return self.math_const(a.attr.id.as_str(), line);
-                    }
+                if let Some(q) = self.std_name(e) {
+                    return self.std_value(&q, line);
                 }
                 let obj = self.expr(&a.value, None)?;
                 match self.norm(&obj.ty) {
@@ -2120,7 +2166,7 @@ impl Front {
 
     fn hashable(&self, t: &Ty, line: u32) -> Res<()> {
         match self.norm(t) {
-            Ty::List(_) | Ty::Set(_) | Ty::Dict(..) => err(line, "unhashable type: lists, sets and dicts cannot be keys"),
+            Ty::List(_) | Ty::Set(_) | Ty::Dict(..) | Ty::Deque(_) => err(line, "unhashable type: lists, sets and dicts cannot be keys"),
             Ty::Float => err(line, "float keys are not supported"),
             Ty::Tuple(ts) => ts.iter().try_for_each(|t| self.hashable(t, line)),
             Ty::Class(c) => {
@@ -2159,6 +2205,11 @@ impl Front {
         if self.funcs.contains_key(n) || self.classes.contains_key(n) {
             return err(line, format!("`{}` cannot be used as a value", n))
                 .map_err(|e| e.hint("functions and classes are not first-class values in the subset"));
+        }
+        if let Some(q) = self.from_names.get(n).cloned() {
+            if !self.funcs.contains_key(n) && !self.classes.contains_key(n) {
+                return self.std_value(&q, line);
+            }
         }
         if self.module_vars.contains(n) && self.cur != self.p.main {
             return err(line, format!("module-level variable `{}` is used inside a function", n))
@@ -2302,7 +2353,7 @@ impl Front {
             let r = match op {
                 CmpOp::In | CmpOp::NotIn => {
                     let elem = match &rt {
-                        Ty::List(t) | Ty::Set(t) | Ty::Dict(t, _) => (**t).clone(),
+                        Ty::List(t) | Ty::Set(t) | Ty::Dict(t, _, _) | Ty::Deque(t) => (**t).clone(),
                         Ty::Str => Ty::Str,
                         Ty::Tuple(ts) if ts.windows(2).all(|w| w[0] == w[1]) => ts[0].clone(),
                         _ => return err(line, format!("`in` needs a list, set, dict or str, not {}", self.tn(&rt))),
@@ -2404,7 +2455,7 @@ impl Front {
             return Ok(self.mk(line, bt, ExprKind::Slice(Box::new(base), lo, hi, st)));
         }
         match &bt {
-            Ty::List(et) => {
+            Ty::List(et) | Ty::Deque(et) => {
                 let i = self.expr(&s.slice, Some(&Ty::Int))?;
                 let i = self.coerce(i, &Ty::Int, "list index")?;
                 let et = (**et).clone();
@@ -2415,11 +2466,19 @@ impl Front {
                 let i = self.coerce(i, &Ty::Int, "string index")?;
                 Ok(self.mk(line, Ty::Str, ExprKind::Index(Box::new(base), Box::new(i))))
             }
-            Ty::Dict(kt, vt) => {
+            Ty::Dict(kt, vt, dk) => {
                 let k = self.expr(&s.slice, Some(kt))?;
                 let k = self.coerce(k, kt, "dict key")?;
                 let vt = (**vt).clone();
-                Ok(self.mk(line, vt, ExprKind::Index(Box::new(base), Box::new(k))))
+                let present = match (&base.kind, &k.kind) {
+                    (ExprKind::Var(d), ExprKind::Var(kv)) => self.loop_keys.get(kv) == Some(d),
+                    _ => false,
+                };
+                let e = self.mk(line, vt, ExprKind::Index(Box::new(base), Box::new(k)));
+                if present && *dk == DK::Default {
+                    self.p.present.insert(e.id);
+                }
+                Ok(e)
             }
             Ty::Tuple(ts) => {
                 let i = self.expr(&s.slice, None)?;
@@ -2585,7 +2644,7 @@ impl Front {
                 let m = a.attr.id.as_str();
                 if matches!(m, "items" | "keys" | "values") && args.args.is_empty() && args.keywords.is_empty() {
                     let d = self.expr(&a.value, None)?;
-                    if let Ty::Dict(k, v) = self.norm(&d.ty) {
+                    if let Ty::Dict(k, v, _) = self.norm(&d.ty) {
                         return Ok(match m {
                             "items" => (Iter::Items(d), Ty::Tuple(vec![*k, *v])),
                             "keys" => (Iter::Keys(d), *k),
@@ -2595,10 +2654,14 @@ impl Front {
                 }
             }
         }
+        if self.std_name(e).as_deref() == Some("sys.stdin") {
+            let x = self.mk(line, Ty::list(Ty::Str), ExprKind::Builtin("sys.stdin.readlines", vec![]));
+            return Ok((Iter::Over(x), Ty::Str));
+        }
         let x = self.expr(e, None)?;
         let t = match self.norm(&x.ty) {
-            Ty::List(t) | Ty::Set(t) => *t,
-            Ty::Dict(k, _) => *k,
+            Ty::List(t) | Ty::Set(t) | Ty::Deque(t) => *t,
+            Ty::Dict(k, _, _) => *k,
             Ty::Str => Ty::Str,
             Ty::Tuple(ts) => {
                 if ts.windows(2).all(|w| w[0] == w[1]) {
@@ -2888,6 +2951,9 @@ impl Front {
                 if let Some(&cid) = self.classes.get(name) {
                     return self.construct(cid, args, line);
                 }
+                if let Some(q) = self.std_name(&c.func) {
+                    return self.std_call(&q, args, want, line);
+                }
                 self.builtin(name, args, want, line)
             }
             AExpr::Attribute(a) if matches!(&*a.value, AExpr::Call(sc) if matches!(&*sc.func, AExpr::Name(n) if n.id.as_str() == "super")) => {
@@ -2923,11 +2989,11 @@ impl Front {
             }
             AExpr::Attribute(a) => {
                 let m = a.attr.id.as_str();
+                if let Some(q) = self.std_name(&c.func) {
+                    return self.std_call(&q, args, want, line);
+                }
                 if let AExpr::Name(n) = &*a.value {
                     if self.lookup(n.id.as_str()).is_none() {
-                        if n.id.as_str() == "math" && self.imports.contains("math") {
-                            return self.math(m, args, line);
-                        }
                         if let Some(&cid) = self.classes.get(n.id.as_str()) {
                             let Some(fid) = self.p.classes[cid].method(m) else {
                                 return err(line, format!("`{}` has no method `{}`", n.id, m));
@@ -2938,9 +3004,6 @@ impl Front {
                             let a = self.call_args(fid, args, false, line)?;
                             let t = self.p.funcs[fid].ret.clone();
                             return Ok(self.mk(line, t, ExprKind::Call(fid, a)));
-                        }
-                        if n.id.as_str() == "sys" {
-                            return err(line, "sys functions are not supported yet");
                         }
                     }
                     if n.id.as_str() == "str" || n.id.as_str() == "dict" || n.id.as_str() == "list" {
@@ -3157,7 +3220,7 @@ impl Front {
                 self.nargs(args, 1, 1, name, line)?;
                 let x = self.expr(&args.args[0], None)?;
                 match self.norm(&x.ty) {
-                    Ty::List(_) | Ty::Str | Ty::Dict(..) | Ty::Set(_) | Ty::Tuple(_) => b(self, "len", Ty::Int, vec![x]),
+                    Ty::List(_) | Ty::Str | Ty::Dict(..) | Ty::Set(_) | Ty::Tuple(_) | Ty::Deque(_) => b(self, "len", Ty::Int, vec![x]),
                     t => err(line, format!("{} has no len()", self.tn(&t))),
                 }
             }
@@ -3275,7 +3338,7 @@ impl Front {
                 self.nargs(args, 0, 0, name, line)?;
                 self.kw(args, &[], line)?;
                 let (k, v) = match want.map(|w| self.norm(w)) {
-                    Some(Ty::Dict(k, v)) => (*k, *v),
+                    Some(Ty::Dict(k, v, _)) => (*k, *v),
                     _ => (self.fresh(), self.fresh()),
                 };
                 Ok(self.mk(line, Ty::dict(k, v), K::Dict(vec![])))
@@ -3445,8 +3508,8 @@ impl Front {
                     err(line, format!("printing a `{}` shows its address; define __str__ or use @dataclass", cl.name))
                 }
             }
-            Ty::List(e) | Ty::Set(e) => self.printable(&e, line),
-            Ty::Dict(k, v) => {
+            Ty::List(e) | Ty::Set(e) | Ty::Deque(e) => self.printable(&e, line),
+            Ty::Dict(k, v, _) => {
                 self.printable(&k, line)?;
                 self.printable(&v, line)
             }
@@ -3459,9 +3522,6 @@ impl Front {
     }
 
     fn math_const(&mut self, name: &str, line: u32) -> Res<Expr> {
-        if !self.imports.contains("math") {
-            return err(line, "`import math` first");
-        }
         let n: &'static str = match name {
             "pi" => "math.pi",
             "e" => "math.e",
@@ -3510,6 +3570,10 @@ impl Front {
             Ok(s.mk(line, t, K::Builtin(n, v)))
         };
         let _ = want;
+        let recv = match self.std_method(recv, m, args, line)? {
+            Ok(e) => return Ok(e),
+            Err(r) => r,
+        };
         match &rt {
             Ty::Class(c) | Ty::Obj(c) => {
                 let c = *c;
@@ -3600,7 +3664,7 @@ impl Front {
                     _ => err(line, format!("list has no method `{}`", m)),
                 }
             }
-            Ty::Dict(kt, vt) => {
+            Ty::Dict(kt, vt, _) => {
                 let (kt, vt) = ((**kt).clone(), (**vt).clone());
                 match m {
                     "get" => {
@@ -3701,7 +3765,7 @@ impl Front {
     }
 
     fn iter_value_from(&mut self, d: Expr, m: &str, line: u32) -> Res<(Expr, Ty)> {
-        let Ty::Dict(k, v) = self.norm(&d.ty) else { unreachable!() };
+        let Ty::Dict(k, v, _) = self.norm(&d.ty) else { unreachable!() };
         let (it, t) = match m {
             "items" => (Iter::Items(d), Ty::Tuple(vec![*k, *v])),
             "keys" => (Iter::Keys(d), *k),
@@ -3857,7 +3921,7 @@ fn has_var(t: &Ty) -> bool {
     match t {
         Ty::Var(_) => true,
         Ty::List(a) | Ty::Set(a) => has_var(a),
-        Ty::Dict(k, v) => has_var(k) || has_var(v),
+        Ty::Dict(k, v, _) => has_var(k) || has_var(v),
         Ty::Tuple(ts) => ts.iter().any(has_var),
         Ty::Optional(t) => has_var(t),
         _ => false,

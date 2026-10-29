@@ -20,14 +20,23 @@ pub fn cargo_toml(name: &str, bins: &[String]) -> String {
 
 pub fn cargo_toml_with(name: &str, bins: &[String], crates: &[String]) -> String {
     let mut deps = String::new();
+    let mut features = vec![];
     for c in crates {
-        deps += &format!("{}\n", c);
+        // `pyrt/re`: a feature of pyrt
+        match c.strip_prefix("pyrt/") {
+            Some(f) => features.push(format!("{:?}", f)),
+            None => deps += &format!("{}\n", c),
+        }
     }
+    features.sort();
+    features.dedup();
+    let feat = if features.is_empty() { String::new() } else { format!(", features = [{}]", features.join(", ")) };
     let mut s = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\npyrt = {{ path = {:?} }}\n{}\n\
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\npyrt = {{ path = {:?}{} }}\n{}\n\
          # Python ints never wrap: overflow is reported instead\n[profile.release]\noverflow-checks = true\n",
         name,
         pyrt_dir(),
+        feat,
         deps
     );
     for b in bins {

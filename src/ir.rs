@@ -15,7 +15,13 @@ pub enum Ty {
     Str,
     None,
     List(Box<Ty>),
-    Dict(Box<Ty>, Box<Ty>),
+    Dict(Box<Ty>, Box<Ty>, DK),
+    /// `collections.deque`
+    Deque(Box<Ty>),
+    /// `re.Pattern` with n groups
+    Pattern(usize),
+    /// `re.Match` with n groups
+    Match(usize),
     Set(Box<Ty>),
     Tuple(Vec<Ty>),
     Class(ClassId),
@@ -41,7 +47,7 @@ impl Ty {
         Ty::Optional(Box::new(t))
     }
     pub fn dict(k: Ty, v: Ty) -> Ty {
-        Ty::Dict(Box::new(k), Box::new(v))
+        Ty::Dict(Box::new(k), Box::new(v), DK::Plain)
     }
     /// Rust `Copy`: numbers, bools and tuples of them.
     pub fn is_copy(&self) -> bool {
@@ -57,6 +63,15 @@ impl Ty {
     }
 }
 
+/// The kind of a dict: `dict`, `collections.defaultdict` (the factory follows
+/// from the value type) or `collections.Counter` (values are ints).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DK {
+    Plain,
+    Default,
+    Counter,
+}
+
 pub struct TyName<'a>(pub &'a Ty, pub &'a Program);
 
 impl fmt::Display for TyName<'_> {
@@ -70,7 +85,12 @@ impl fmt::Display for TyName<'_> {
             Ty::None => write!(f, "None"),
             Ty::List(t) => write!(f, "list[{}]", TyName(t, p)),
             Ty::Set(t) => write!(f, "set[{}]", TyName(t, p)),
-            Ty::Dict(k, v) => write!(f, "dict[{}, {}]", TyName(k, p), TyName(v, p)),
+            Ty::Dict(k, v, DK::Plain) => write!(f, "dict[{}, {}]", TyName(k, p), TyName(v, p)),
+            Ty::Dict(k, v, DK::Default) => write!(f, "defaultdict[{}, {}]", TyName(k, p), TyName(v, p)),
+            Ty::Dict(k, _, DK::Counter) => write!(f, "Counter[{}]", TyName(k, p)),
+            Ty::Deque(t) => write!(f, "deque[{}]", TyName(t, p)),
+            Ty::Pattern(_) => write!(f, "re.Pattern"),
+            Ty::Match(_) => write!(f, "re.Match"),
             Ty::Tuple(ts) => {
                 write!(f, "tuple[")?;
                 for (i, t) in ts.iter().enumerate() {
@@ -332,6 +352,8 @@ pub struct Func {
     pub vars: Vec<Var>,
     pub is_init: bool,
     pub is_static: bool,
+    /// `@functools.cache`: results remembered by argument
+    pub cache: bool,
     /// loop variables that reuse the name of a local: (loop var, local)
     pub shadows: Vec<(VarId, VarId)>,
     /// a method of a class with subclasses: the implementation of each class
@@ -406,6 +428,9 @@ pub struct Program {
     pub main: FuncId,
     /// crates used through stubs: Cargo dependency lines (`regex = "1"`)
     pub crates: Vec<String>,
+    /// `d[k]` of a defaultdict where k is the variable of a loop over d's keys:
+    /// the key exists, nothing is inserted
+    pub present: std::collections::HashSet<u32>,
 }
 
 impl Program {

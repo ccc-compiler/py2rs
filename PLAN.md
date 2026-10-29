@@ -10,11 +10,28 @@ rejection has a test in `tests/err/`.
 | v0.3 | reliability: ~150-program corpus, definite assignment, random program fuzzer, CI | done |
 | v0.4 | mutable reference locals, moving out of narrowed values, `from rust import Ref, Mut, Own`, `py2rs explain`, usability batch | done |
 | v0.5 | `from rust.CRATE import X`: Cargo dependencies, rustdoc-JSON stubs, borrow / Result / Option mapping, `inline` | done |
-| v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time, os.path, files | |
-| v0.7 | `with`, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | |
+| v0.6 | stdlib: collections, itertools, functools, heapq, bisect, random (MT19937), re, json, sys, time | done |
+| v0.7 | `with`, files, `match`, closures / nested functions / `Callable`, `@property`, `@classmethod`, class attributes, operator dunders | |
 | v0.8 | generators, exception fields, return in try/finally, `Union`, `Protocol`, generics, `*args`, multi-file projects, `@shared` (`Rc<RefCell>`) | |
 | v0.9 | benchmarks vs CPython, ASCII strings, fewer clones, buffered print, optional bigint / fixed-width ints, CPython set order | |
 | v1.0 | crates.io packages (publish needs the owner's go-ahead), docs in three languages, subset spec, case studies, PyO3 module output | |
+
+## v0.6 result
+
+- `collections`: `Ty::Dict(k, v, DK)` with `DK::{Plain, Default, Counter}` (`pyrt::DefaultDict`,
+  `pyrt::Counter`, both deref to `IndexMap`; CPython's reprs), `Ty::Deque` (`VecDeque`).
+  `d[k]` of a defaultdict inserts (`.at(k)` / `.val(k)`), except for the key of a loop
+  over d (`Program.present`)
+- `heapq` / `bisect` / `itertools` / `functools.reduce` / `random` / `sys` / `time` /
+  `json.dumps` in `pyrt::stdlib`; `random` is CPython's MT19937 (`init_by_array`,
+  `_randbelow`, `shuffle`, `sample`) and matches it number for number
+- `@cache` / `@lru_cache(maxsize=None)`: a wrapper with a per-thread `HashMap`
+- `re` on the regex crate (`pyrt` feature `re`, enabled per program): literal patterns
+  compiled when translating; lookaround, backreferences and `$` are rejected
+- storing a value that is still used afterwards (`rows.append(row); print(sum(row))`) is
+  no longer rejected: a copy is stored unless either side is modified later
+- unused module constants are not emitted; int literals beyond i32 get `_i64`
+- files moved to v0.7 (they need `with`)
 
 ## v0.4 result
 

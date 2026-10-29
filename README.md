@@ -117,7 +117,23 @@ with `__init__`, methods, `@staticmethod`, `__str__` / `__repr__`; single inheri
 with overriding, `super()`, `isinstance`; if / while / for (with `else`), comprehensions,
 generator expressions in `sum/min/max/any/all/sorted/list/set/join`, `lambda` as `key=`,
 f-strings with format specs, `try` / `except` / `else` / `finally`, `raise`, exception
-classes, `assert`, `del`, `math`, most `str` / `list` / `dict` / `set` methods.
+classes, `assert`, `del`, most `str` / `list` / `dict` / `set` methods.
+
+Standard library (`import M` or `from M import x`):
+
+| module | supported |
+|---|---|
+| `math` | constants and functions |
+| `collections` | `defaultdict` (int / float / str / bool / list / set / dict factories), `Counter` (`most_common`, `total`, `elements`, `update`), `deque` |
+| `heapq` | `heappush`, `heappop`, `heapify`, `heappushpop`, `heapreplace`, `nlargest`, `nsmallest` (CPython's heap layout) |
+| `bisect` | `bisect_left`, `bisect_right` / `bisect`, `insort_left`, `insort_right` / `insort` |
+| `itertools` | `permutations`, `combinations`, `product` (incl. `repeat=`), `chain`, `accumulate`, `pairwise` (tuple lengths are literals) |
+| `functools` | `reduce` with a lambda, `@cache` / `@lru_cache(maxsize=None)` |
+| `random` | `seed`, `random`, `randint`, `randrange`, `uniform`, `choice`, `shuffle`, `sample`: CPython's Mersenne Twister, so the same seed gives the same numbers |
+| `re` | `compile`, `search`, `match`, `fullmatch`, `findall`, `finditer`, `sub`, `split`, `escape`, flags `I` / `M` / `S`; `Match.group` / `groups` / `start` / `end` / `span`. Patterns are literals, checked when translating, and run on the `regex` crate |
+| `sys` | `argv`, `exit`, `stdin` (`readline`, `read`, `readlines`, iteration), `stdout.write`, `maxsize`, `setrecursionlimit` (the program runs on a 1 GB stack) |
+| `time` | `time`, `perf_counter`, `monotonic`, `sleep` |
+| `json` | `dumps` |
 
 How the Python constructs map to Rust:
 
@@ -141,8 +157,11 @@ Rejected with a hint: `Any` / unannotated parameters, a variable changing type,
 iterating over it, `x or default` on non-bools, `is` other than with None, overrides that
 change a method's types, multiple inheritance. Not yet supported: return / break inside
 `try ... finally`, exceptions from comprehensions inside a `try`, exception classes with
-fields, `with`, `match`, generators (`yield`), async, imports beyond `math`,
-`dataclasses`, `typing`.
+fields, `with`, `match`, generators (`yield`), async, files, other modules. In `re`:
+lookaround and backreferences (the regex crate has neither), `$` without `re.M`
+(Python's `$` also matches before a final newline; use `\Z` or `fullmatch`), function
+replacements; `Match.group(n)` of a group that did not take part raises (Python gives
+None).
 
 Known differences: set iteration order is insertion order (CPython's is hash order);
 `int` is 64-bit.

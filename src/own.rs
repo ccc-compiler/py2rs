@@ -341,13 +341,7 @@ fn prefix(a: &Path, b: &Path) -> bool {
 
 /// Methods of builtin types that modify their receiver.
 fn mutating(name: &str) -> bool {
-    matches!(
-        name,
-        "list.append" | "list.extend" | "list.insert" | "list.pop" | "list.pop_at" | "list.remove"
-            | "list.sort" | "list.reverse" | "list.clear" | "list.swap" | "dict.pop" | "dict.pop_default"
-            | "dict.setdefault" | "dict.clear" | "dict.update" | "set.add" | "set.remove"
-            | "set.discard" | "set.clear"
-    )
+    crate::gen::mutating_builtin(name)
 }
 
 /// Per-function analysis.
@@ -370,6 +364,8 @@ struct Fn<'a> {
     /// variables that hold a copy of a value still reachable elsewhere
     alias_src: HashMap<VarId, Vec<(VarId, Path)>>,
     pending: Vec<(VarId, Path, Option<VarId>, u32, u32)>,
+    /// a copy of a still-live value stored in a container: (source root, path, position, line)
+    stores: Vec<(VarId, Path, u32, u32)>,
     live_out: HashMap<u32, HashSet<VarId>>,
     live_in: HashMap<u32, HashSet<VarId>>,
     /// narrowed value → (statement that binds it, first statement where it is bound / None for let-else)
@@ -408,6 +404,7 @@ impl<'a> Fn<'a> {
             origin: HashMap::new(),
             alias_src: HashMap::new(),
             pending: vec![],
+            stores: vec![],
             live_out: HashMap::new(),
             live_in: HashMap::new(),
             narrow_site: HashMap::new(),
@@ -820,6 +817,13 @@ impl<'a> Fn<'a> {
                 }
             }
             ExprKind::Builtin(name, args) => self.builtin(name, args, e),
+            // `d[k]` of a defaultdict inserts the default
+            ExprKind::Index(b, k) if matches!(b.ty, Ty::Dict(_, _, DK::Default)) && !self.p.present.contains(&e.id) => {
+                if let Some((r, p)) = self.place(b) {
+                    self.mutate(r, p, false, e.line);
+                }
+                self.owned(k, Dest::Escape, e.line);
+            }
             _ => {}
         }
     }
@@ -848,7 +852,9 @@ impl<'a> Fn<'a> {
                 self.owned(&args[1], Dest::Escape, e.line);
                 self.owned(&args[2], Dest::Escape, e.line);
             }
-            "list.extend" => self.store_elements(&args[1], e.line),
+            "list.extend" | "deque.extend" | "counter.update" => self.store_elements(&args[1], e.line),
+            "heapq.heappush" | "heapq.heappushpop" | "heapq.heapreplace" | "bisect.insort_left" | "bisect.insort_right"
+            | "deque.append" | "deque.appendleft" => self.owned(&args[1], Dest::Escape, e.line),
             "dict.update" => self.store_elements(&args[1], e.line),
             _ => {}
         }
@@ -858,7 +864,7 @@ impl<'a> Fn<'a> {
     fn store_elements(&mut self, it: &Expr, line: u32) {
         let elem = match &it.ty {
             Ty::List(t) | Ty::Set(t) => (**t).clone(),
-            Ty::Dict(_, v) => (**v).clone(),
+            Ty::Dict(_, v, _) => (**v).clone(),
             t => t.clone(),
         };
         if self.imm(&elem) {
@@ -1060,13 +1066,11 @@ impl<'a> Fn<'a> {
                     }
                 }
             }
+            // stored as a copy; checked in `check` against later modifications
             Dest::Escape => {
-                let (r, _) = &sources[0];
-                let name = &self.f.vars[*r].name;
-                self.errors.push(
-                    Error::new(line, format!("this stores a value that is still reachable through `{}`", name))
-                        .hint("Python would share one object between both places; store a copy (.copy(), list(...), a new object)"),
-                );
+                for (r, p) in sources {
+                    self.stores.push((r, p, self.cur_pos, line));
+                }
             }
         }
     }
@@ -1283,7 +1287,7 @@ impl<'a> Fn<'a> {
     fn sources(&self, e: &Expr) -> Vec<(VarId, Path)> {
         let elem_mut = |t: &Ty| match t {
             Ty::List(x) | Ty::Set(x) => !self.imm(x),
-            Ty::Dict(k, v) => !self.imm(k) || !self.imm(v),
+            Ty::Dict(k, v, _) => !self.imm(k) || !self.imm(v),
             _ => true,
         };
         let mut out = vec![];
@@ -1713,6 +1717,29 @@ impl<'a> Fn<'a> {
                     return Err(Error::new(line, format!(
                         "{} share one object in Python, and it is modified later (line {})", what, m.line))
                         .hint("make an explicit copy (.copy(), list(...), [r.copy() for r in ...]) or avoid the second name"));
+                }
+            }
+        }
+        // a stored copy must stay equal to its source while the source is used:
+        // neither may be modified (anything reached through a path or modified
+        // deeply might be the stored copy)
+        for (root, path, pos, line) in self.stores.clone() {
+            for m in &self.muts {
+                if !self.after(pos, m.pos) {
+                    continue;
+                }
+                let src_live = self.live_out.get(&m.sid).map(|l| l.contains(&root)).unwrap_or(true);
+                let hit = if m.root == root {
+                    prefix(&path, &m.path) || (m.deep && prefix(&m.path, &path))
+                } else {
+                    src_live && (m.deep || !m.path.is_empty())
+                };
+                if hit {
+                    let src = &self.f.vars[root].name;
+                    return Err(Error::new(line, format!(
+                        "this stores `{}`, which Python shares with the container, and one of them is modified later (line {})",
+                        src, m.line))
+                        .hint("store a copy (.copy(), list(...), a new object)"));
                 }
             }
         }

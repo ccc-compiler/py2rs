@@ -9,10 +9,15 @@ pub use indexmap::{IndexMap, IndexSet};
 
 pub mod err;
 pub mod math;
+#[cfg(feature = "re")]
+pub mod re;
 pub mod spec;
+pub mod stdlib;
 pub mod strs;
 
 pub use err::*;
+pub use stdlib::{with_stack, Counter, DefaultDict};
+pub use std::collections::VecDeque;
 pub use strs::*;
 
 // ------------------------------------------------------------------ errors
@@ -1025,3 +1030,23 @@ pub fn unpack4<T>(v: Vec<T>) -> (T, T, T, T) {
     let mut it = v.into_iter();
     (it.next().unwrap(), it.next().unwrap(), it.next().unwrap(), it.next().unwrap())
 }
+
+/// A list of length n as an n-tuple (itertools results).
+pub fn tup1<T>(v: Vec<T>) -> (T,) {
+    let mut i = v.into_iter();
+    (i.next().unwrap(),)
+}
+
+macro_rules! tup_n {
+    ($name:ident, $($t:ident),+) => {
+        pub fn $name<T>(v: Vec<T>) -> ($($t,)+) {
+            let mut i = v.into_iter();
+            ($({ let x: $t = i.next().unwrap(); x },)+)
+        }
+    };
+}
+tup_n!(tup2, T, T);
+tup_n!(tup3, T, T, T);
+tup_n!(tup4, T, T, T, T);
+tup_n!(tup5, T, T, T, T, T);
+tup_n!(tup6, T, T, T, T, T, T);
